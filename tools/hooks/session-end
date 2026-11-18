@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+// セッションの終わりに、この会話を抽出待ちに積み、学びの抽出を切り離したプロセスで起動する（H-I10）。
+// 利用者の終了を妨げないので、どんな失敗でも終了コード 0 で、失敗は stderr に書く。
+// 積むのは、標準入力の transcript_path を gori のチェックアウトの抽出待ち（tools/lib/learning.mjs の pendingDir）へ書くことで、抽出はこの一覧だけを読む。
+// 積まない場合: 抽出やレビューのためのセッション、ルートが gori のチェックアウトでない。
+// 起動しない場合: そのうえで、間引きの期間内（前の起動から GORI_EXTRACT_INTERVAL_HOURS、既定 20 時間）、抽出が既に動いている。
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { enqueue, goriHome, logSkip, resolveRoot } from '../lib/learning.mjs';
+
+// 標準入力は、閉じられなくても終了を遅らせないよう、短い期限で読み切る。
+// SessionEnd フックの既定の時間の上限は 1.5 秒である（https://code.claude.com/docs/en/hooks）。
+const STDIN_DEADLINE_MS = 300;
+function readInput() {
+  return new Promise((done) => {
+    if (process.stdin.isTTY) return done({});
+    let buf = '';
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.removeAllListeners();
+      process.stdin.destroy();
+      let o = {};
+      try {
+        o = JSON.parse(buf);
+      } catch {
+        // 壊れた入力や空の入力では積まない。
+      }
+      done(o && typeof o === 'object' ? o : {});
+    };
+    const timer = setTimeout(finish, STDIN_DEADLINE_MS);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => {
+      buf += c;
+    });
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
+  });
+}
+
+try {
+  if (process.env.GORI_EXTRACTING || process.env.GORI_REVIEWING) process.exit(0);
+  const home = goriHome();
+  const state = join(home, 'state');
+  const here = dirname(fileURLToPath(import.meta.url));
+  // ルートが gori のチェックアウトでなければ、積む先も抽出の書き込み先も無い。理由を一行だけログに書いて終わる。
+  const found = resolveRoot(process.env.CLAUDE_PLUGIN_ROOT || resolve(here, '..', '..'));
+  if (!found.root) {
+    logSkip(home, found.reason);
+    console.error(`session-end: ${found.reason}`);
+    process.exit(0);
+  }
+  const input = await readInput();
+  try {
+    enqueue(found.root, input.transcript_path);
+  } catch (e) {
+    // 積めなくても抽出の起動は続ける。積まれなかった会話は、手で名指ししない限り読まれない。
+    console.error(`session-end: 抽出待ちに積めない: ${e.message}`);
+  }
+  const lastFile = join(state, 'last-extract');
+  const lockFile = join(state, 'extract.lock');
+
+  // 既定を 24 時間より短くするのは、起動が「間隔が過ぎた後に最初に終わったセッション」なので、24 時間だと起動の時刻が毎日後ろへずれていくためである。
+  const DEFAULT_INTERVAL_HOURS = 20;
+  const hours = process.env.GORI_EXTRACT_INTERVAL_HOURS === undefined ? DEFAULT_INTERVAL_HOURS : Number(process.env.GORI_EXTRACT_INTERVAL_HOURS);
+  const interval = Number.isFinite(hours) && hours >= 0 ? hours : DEFAULT_INTERVAL_HOURS;
+  let last = NaN;
+  try {
+    last = Number(readFileSync(lastFile, 'utf8').trim());
+  } catch {
+    // 無ければ初めての起動。
+  }
+  if (Number.isFinite(last) && Date.now() - last < interval * 3600 * 1000) process.exit(0);
+
+  // ロックの持ち主が生きていなければ古い印として取り除く。生きていれば起動しない。
+  let held = null;
+  try {
+    held = Number(readFileSync(lockFile, 'utf8').trim());
+  } catch {
+    // ロックが無い。
+  }
+  if (held !== null) {
+    let alive = false;
+    if (Number.isInteger(held) && held > 0) {
+      try {
+        process.kill(held, 0);
+        alive = true;
+      } catch (e) {
+        alive = e.code === 'EPERM';
+      }
+    }
+    if (alive) process.exit(0);
+    rmSync(lockFile, { force: true });
+  }
+
+  // GORI_EXTRACT_RUN は起動する道具の差し替え口（テスト用）。
+  const run = process.env.GORI_EXTRACT_RUN || resolve(here, '..', 'learning', 'extract-run');
+  if (!existsSync(run)) throw new Error(`${run} が無い`);
+  const child = spawn(run, [], { detached: true, stdio: 'ignore', env: process.env });
+  child.on('error', (e) => console.error(`session-end: 抽出を起動できない: ${e.message}`));
+  child.unref();
+  if (child.pid) {
+    mkdirSync(state, { recursive: true });
+    writeFileSync(lastFile, `${Date.now()}\n`);
+  }
+  // spawn の失敗（error イベント）を拾うため、一周だけ待ってから終わる。
+  setTimeout(() => process.exit(0), 100);
+} catch (e) {
+  console.error(`session-end: ${e.message}`);
+  process.exit(0);
+}

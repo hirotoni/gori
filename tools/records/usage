@@ -1,0 +1,78 @@
+#!/usr/bin/env node
+import { parseArgs } from '../lib/args.mjs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { discoverUnits } from '../lib/units.mjs';
+
+const { flags: parsed, positional: extra } = parseArgs(process.argv.slice(2), { value: ['since', 'projects', 'root'] }, '使い方: usage [--since YYYY-MM-DD] [--projects <dir>] [--root <gori>]');
+if (extra.length) {
+  console.error(`引数 ${extra.join(' ')} を読めない`);
+  process.exit(2);
+}
+const opt = (name) => parsed[name.slice(2)];
+const since = opt('--since');
+if (since !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+  console.error('--since は YYYY-MM-DD で渡す');
+  process.exit(2);
+}
+const projects = resolve(opt('--projects') ?? join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects'));
+const root = resolve(opt('--root') ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+
+const units = discoverUnits(root);
+let oldest = null;
+let newest = null;
+const stats = new Map(units.map((u) => [u.key, { invoked: 0, read: 0 }]));
+// 前後の文字を確かめないと research.md.bak や myknowledge/ を読んだことになる。
+const pathPattern = new Map(units.map((u) => [u.key, new RegExp(`(?<![\\w.-])${u.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`)]));
+
+function* jsonlFiles(dir) {
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) yield* jsonlFiles(p);
+    else if (name.endsWith('.jsonl')) yield p;
+  }
+}
+
+// ツールの結果（type が user の行）に出たパスは、ファイルを読んだ証拠にならないので見ない。
+function scan(file) {
+  const invoked = new Set();
+  const read = new Set();
+  for (const text of readFileSync(file, 'utf8').split('\n')) {
+    if (!text) continue;
+    let o;
+    try {
+      o = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    if (typeof o.timestamp === 'string') {
+      const d = o.timestamp.slice(0, 10);
+      if (oldest === null || d < oldest) oldest = d;
+      if (newest === null || d > newest) newest = d;
+    }
+    if (o.type !== 'assistant' || !Array.isArray(o.message?.content)) continue;
+    if (since && !(typeof o.timestamp === 'string' && o.timestamp.slice(0, 10) >= since)) continue;
+    for (const b of o.message.content) {
+      if (b.type !== 'tool_use' || !b.input) continue;
+      for (const u of units) {
+        if (b.name === 'Skill' && b.input.skill === `gori:${u.id}`) invoked.add(u.key);
+        const target = b.name === 'Read' ? b.input.file_path : b.name === 'Bash' ? b.input.command : null;
+        if (typeof target === 'string' && pathPattern.get(u.key).test(target)) read.add(u.key);
+      }
+    }
+  }
+  for (const k of invoked) stats.get(k).invoked++;
+  for (const k of read) stats.get(k).read++;
+}
+
+for (const f of jsonlFiles(projects)) scan(f);
+
+const rows = [...stats].map(([key, s]) => ({ key, ...s }));
+rows.sort((a, b) => a.invoked + a.read - (b.invoked + b.read) || (a.key < b.key ? -1 : 1));
+if (since && oldest && since < oldest) console.error(`--since ${since} より前の会話の記録は残っていない（最も古いのは ${oldest}）`);
+console.log(`# window: ${oldest ?? '-'} .. ${newest ?? '-'}`);
+console.log(['key', 'invoked', 'read'].join('\t'));
+for (const r of rows) console.log([r.key, r.invoked, r.read].join('\t'));

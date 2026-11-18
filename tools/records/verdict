@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+import { parseArgs } from '../lib/args.mjs';
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { RESULTS, TASK_ID, TASK_ID_FORM, auditPath, envSessionId, git, gitCommonDir, nowIso, recordsGori, resolveRepoDir, sanitize, storeVerdict, verdictFileName, verdictState, workerSessions } from '../lib/audit.mjs';
+import { secretFields } from '../lib/secrets.mjs';
+
+const [sub, ...rest] = process.argv.slice(2);
+const VERDICT_USAGE = '使い方: verdict record|check（docs/design.md 参照）';
+const { flags, positional: extra } = parseArgs(rest, { value: ['task', 'sha', 'result', 'model', 'repo'], repeat: ['evidence', 'finding', 'suggest'], bool: ['json'] }, VERDICT_USAGE);
+if (extra.length) {
+  console.error(`引数 ${extra.join(' ')} を読めない（フラグの値なら、その前のフラグの綴りを確かめる）\n${VERDICT_USAGE}`);
+  process.exit(2);
+}
+
+const die = (msg, code = 2, rule = null) => {
+  console.error(rule ? `${rule}: ${msg}` : msg);
+  process.exit(code);
+};
+
+const repo = resolveRepoDir(flags.repo, flags.task);
+if (!flags.task || !TASK_ID.test(flags.task)) die(`--task には ${TASK_ID_FORM} の作業 ID を渡す`);
+const task = flags.task;
+let audit;
+try {
+  audit = auditPath(repo, task);
+} catch (e) {
+  die(e.message, 2);
+}
+
+function resolveSha() {
+  const sha = git(repo, ['rev-parse', '--verify', `${flags.sha ?? 'HEAD'}^{commit}`]);
+  if (!sha) die(`${repo}: ${flags.sha ?? 'HEAD'} を commit に解決できない（git が使えない、または rev が無い）`);
+  return sha;
+}
+
+// レビュー結果の道は二通りだけ。
+// - review が起動したレビュアー: セッション ID と GORI_VERDICT_OUTBOX がある。レビュー結果は受け取り口にだけ書き、作業リポジトリには何も書かない。
+//   受け取り口のレビュー結果を数えるのは、その受け取り口を作った review が、レビュアーのセッションと task と sha を確かめて取り込んだときだけである。
+//   作業者が GORI_VERDICT_OUTBOX を自分で立てても、その受け取り口は誰も取り込まない。
+// - 端末から実行した人間: セッション ID の環境変数が無く、標準入力が端末。記録の場所（gori のチェックアウトの .git/gori/repos/<名前>/verdicts）に直接書く。
+// セッション ID があって受け取り口が無い実行（作業者のセッション）は拒む。
+// TTY を環境変数で差し替える口は作らない（作業者の抜け道になる）。テストは疑似端末を使う。
+// 疑似端末（script など）を作って人間を装うのは意図的な回避であり、この仕組みは防がない（criteria/done）。
+function judgeOf() {
+  const sid = envSessionId();
+  const outbox = process.env.GORI_VERDICT_OUTBOX;
+  const hint = 'レビューは tools/records/review に依頼する';
+  if (sid && outbox) return { judge: `session:${sid}`, outbox };
+  if (sid) die(`作業者のセッション（review の受け取り口が無い）はレビュー結果を記録できない。${hint}`, 1, 'not-judge');
+  if (outbox) die(`GORI_VERDICT_OUTBOX はセッション ID のあるレビュアーだけが使う。${hint}`, 1, 'not-judge');
+  if (!process.stdin.isTTY) die(`セッション ID も端末も無い実行はレビュー結果を記録できない。${hint}`, 1, 'not-judge');
+  const name = git(repo, ['config', 'user.name']);
+  if (!name) die('レビュアーを決められない（git の user.name が無い）');
+  return { judge: `human:${sanitize(name)}`, outbox: null };
+}
+
+const workers = () => workerSessions(readFileSync(audit, 'utf8'));
+
+function record() {
+  if (!RESULTS.includes(flags.result)) die(`--result には ${RESULTS.join('、')} のどれかを渡す`);
+  const sha = resolveSha();
+  if (!existsSync(audit)) die(`${audit}: 判断の記録が無い。先に log start を実行する`, 1);
+  if (flags.result === 'pass' && flags.evidence.length === 0) die('pass には --evidence を一つ以上渡す（実物で確かめた証拠）', 1);
+  if (flags.result === 'fail' && flags.finding.length === 0) die('fail には --finding を一つ以上渡す', 1);
+  // --suggest は、合格にしたうえで直すことを勧める指摘である（agents/reviewer）。不合格の指摘（findings）と混ぜないよう、pass にだけ付け、pass には --finding を付けない。
+  if (flags.suggest.length && flags.result !== 'pass') die('--suggest は pass にだけ付ける。満たしていない基準は --finding に書く', 1);
+  if (flags.result === 'pass' && flags.finding.length) die('pass には --finding を付けない。直すことを勧める指摘は --suggest に書く', 1);
+  // 確認できず（unverified）は、満たしていない基準が無く、確かめる手段の無い基準が残るときの結果である（docs/design.md）。
+  // 試さずに選べないよう、確かめられなかった基準（finding）と、試したコマンドとその出力（evidence）の両方を求める。
+  if (flags.result === 'unverified' && (flags.finding.length === 0 || flags.evidence.length === 0)) die('unverified には --finding（確かめられなかった基準と、何があれば確かめられるか）と --evidence（試したコマンドとその出力）を、それぞれ一つ以上渡す', 1);
+  const secrets = secretFields({ '--finding': flags.finding, '--evidence': flags.evidence, '--suggest': flags.suggest });
+  if (secrets.length) die(`secret-like: ${secrets.join('、')} に秘密情報らしい文字列がある。伏せるか言い換えて書き直す（記録は作業の後も残る）`, 2, 'secret-like');
+  // レビューした対象が commit と一致しなくなるので、HEAD をレビューするときは作業ツリーが clean でなければならない。
+  if (sha === git(repo, ['rev-parse', 'HEAD'])) {
+    const dirty = (git(repo, ['status', '--porcelain']) ?? '').split('\n').filter(Boolean);
+    if (dirty.length) die(`未コミットの変更がある（${dirty.length} 件）。commit してからレビューする`, 1, 'dirty-tree');
+  }
+  const { judge, outbox } = judgeOf();
+  const session = judge.startsWith('session:') ? judge.slice('session:'.length) : null;
+  if (session && workers().has(session)) die(`レビュアー ${judge} は判断の記録に作業者として現れる。成果を作った者はレビューできない`, 1, 'self-judgment');
+
+  const body = { task, sha, judge, result: flags.result, evidence: flags.evidence, findings: flags.finding, ...(flags.suggest.length ? { suggestions: flags.suggest } : {}), time: nowIso(), model: flags.model ?? null };
+  if (outbox) {
+    if (!existsSync(outbox) || !statSync(outbox).isDirectory()) die(`${outbox}: 受け取り口が無い`, 2);
+    // 受け取り口が作業リポジトリかその git の共通ディレクトリ、gori のチェックアウトかその git の共通ディレクトリの中にあれば、
+    // そこへ書くことは記録や知識ファイルを直接書き換えるのと同じになる。tools/records/review の denyWrite と同じ範囲である。
+    const inside = (root) => {
+      const rel = relative(realpathSync(root), realpathSync(outbox));
+      return !rel.startsWith('..') && !rel.startsWith('/');
+    };
+    let gori;
+    try {
+      gori = recordsGori();
+    } catch (e) {
+      die(e.message, 2);
+    }
+    const roots = [repo, gitCommonDir(repo), gori, gitCommonDir(gori)].filter(Boolean);
+    if (roots.some(inside)) die(`${outbox}: 受け取り口が作業リポジトリか gori のチェックアウト、またはその git の共通ディレクトリの中にある。レビューは tools/records/review に依頼する`, 1, 'not-judge');
+    const file = join(outbox, verdictFileName(judge));
+    writeFileSync(file, `${JSON.stringify(body, null, 2)}\n`, { flag: 'wx' });
+    console.log(`${file}（review が確かめてから作業リポジトリに取り込む）`);
+    return;
+  }
+  let res;
+  try {
+    res = storeVerdict(repo, audit, body);
+  } catch (e) {
+    die(e.message, 2);
+  }
+  if (res.violations.length) {
+    for (const v of res.violations) console.error(`${audit}:${v.line}: ${v.rule}: ${v.message}`);
+    die('レビュー結果は書いたが、判断の記録への追記が検査に落ちた', 1);
+  }
+  console.log(res.file);
+}
+
+function check() {
+  const out = (code, state, reason, extra = {}) => {
+    if (flags.json) console.log(JSON.stringify({ task, state, reason, ...extra }));
+    else console.log(`${state}: ${reason}`);
+    process.exit(code);
+  };
+  const sha = git(repo, ['rev-parse', '--verify', `${flags.sha ?? 'HEAD'}^{commit}`]);
+  if (!sha) return out(2, '不明', `${flags.sha ?? 'HEAD'} を commit に解決できない（git が使えない、または rev が無い）`);
+  const v = verdictState(repo, task, sha, audit);
+  return out(v.code, v.state, v.reason, { sha, ...v.extra });
+}
+
+const cmds = { record, check };
+if (!cmds[sub]) die('使い方: verdict record|check（docs/design.md 参照）');
+cmds[sub]();

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# 作業のブランチに、main（無ければ master）の最新を、criteria/done の取り込み方で取り込む。
+# origin があれば fetch し、ローカルの main が origin の既定ブランチの祖先なら、ついでにローカルの main を fast-forward で最新にする。
+# main を checkout している worktree があればそこで merge --ff-only し（未 commit の変更と重なれば git が断るので、警告して続ける）、無ければ ref だけを進める。
+# 取り込むのは、ローカルの main と origin の既定ブランチのうち、もう一方を含む方である。分岐していれば、止まらずにローカルの main を取り込み、
+# UPSTREAM_DIVERGED=<ローカルの SHA>...<origin の SHA> の一行で知らせる。上流を merge で取り込む手順は無い（docs/design.md の「公開と上流」）。
+# 環境変数 GORI_IGNORE_UPSTREAM=1 なら、上流を取り込まないと決めたマシンとして、origin を fetch せず、比べず、ローカルの main も進めない（0 か未設定なら上のとおり）。
+# main の外にある commit のうち、一つでもレビューを受けていれば（記録の場所の verdicts/<SHA>/ がある。記録の場所は tools/lib/audit.mjs の goriDir で、gori のチェックアウトの .git/gori/repos/<名前>/）、
+# レビュー結果と SHA の対応を切らないよう git merge --no-edit で取り込む。一つも無ければ git rebase で載せ直す。
+# 作業ツリーは、--task があれば作業 ID のブランチを checkout した worktree、無ければ今の作業ツリーである。
+# 衝突したら、merge か rebase の途中のまま止まる。解いて続けるか --abort で戻すかは、呼んだ側が決める。
+# 使い方: sync-main [--task <作業ID>]
+# 出力: ローカルの main を進めたときだけ先に MAIN_UPDATED=<旧い SHA>..<新しい SHA> の一行、分岐していれば UPSTREAM_DIVERGED=<ローカル>...<origin> の一行。続いて UP_TO_DATE、MERGED、REBASED、CONFLICT のどれか一行（CONFLICT の後に衝突したファイルが一行ずつ続く）
+# 終了コード: 0 取り込んだか既に含む、1 衝突した、2 使い方の誤りか取り込めない状態（未 commit の変更、main が無い、ブランチの外、GORI_IGNORE_UPSTREAM の値の誤り、記録の場所を決められない）
+set -u
+err() { echo "sync-main: $*" >&2; }
+
+task=""
+case "${1:-}" in
+  --task)
+    task="${2:-}"
+    [ -n "$task" ] && [ $# -eq 2 ] || { err "使い方: sync-main [--task <作業ID>]"; exit 2; }
+    ;;
+  "") ;;
+  *) err "使い方: sync-main [--task <作業ID>]"; exit 2 ;;
+esac
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  err "git リポジトリの中で実行する"
+  exit 2
+fi
+dir="$(git rev-parse --show-toplevel)"
+if [ -n "$task" ]; then
+  dir="$(git worktree list --porcelain | awk -v b="branch refs/heads/$task" '/^worktree /{w=substr($0,10)} $0==b{print w; exit}')"
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    err "作業 ID $task のブランチを checkout した worktree が無い"
+    exit 2
+  fi
+fi
+g() { git -C "$dir" "$@"; }
+
+if [ -z "$(g branch --show-current)" ]; then
+  err "$dir はブランチの上に無い（detached HEAD か、merge や rebase の途中）"
+  exit 2
+fi
+if [ -n "$(g status --porcelain --untracked-files=no)" ]; then
+  err "$dir に未 commit の変更がある。commit してから実行する"
+  exit 2
+fi
+# レビュー結果の場所は、何かを変える前に決める。決められなければ、merge か rebase かを選べないので止まる（レビュー結果が無いと見なして rebase しない）。
+audit="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/audit.mjs"
+if ! records="$(node --input-type=module -e 'const { goriDir } = await import(process.argv[1]); try { console.log(goriDir(process.argv[2])); } catch (e) { console.error(e.message); process.exit(2); }' "$audit" "$dir")"; then
+  err "レビュー結果の場所を決められないので、merge か rebase かを選べない"
+  exit 2
+fi
+verdicts="$records/verdicts"
+main=""
+for b in main master; do
+  if g show-ref --verify -q "refs/heads/$b"; then main="$b" && break; fi
+done
+if [ -z "$main" ]; then
+  err "ローカルの main も master も無い"
+  exit 2
+fi
+
+case "${GORI_IGNORE_UPSTREAM:-0}" in
+  0) upstream=1 ;;
+  1) upstream=0 ;;
+  *) err "GORI_IGNORE_UPSTREAM は 0 か 1 にする（${GORI_IGNORE_UPSTREAM}）"; exit 2 ;;
+esac
+
+target="$main"
+if [ "$upstream" = 1 ] && g remote get-url origin >/dev/null 2>&1; then
+  g fetch -q origin || err "origin の fetch に失敗した。最後に取得した状態で続ける"
+  remote="$(g symbolic-ref -q --short refs/remotes/origin/HEAD)"
+  [ -n "$remote" ] || remote="origin/$main"
+  if [ "${remote#origin/}" = "$main" ] && g show-ref --verify -q "refs/remotes/$remote"; then
+    if g merge-base --is-ancestor "$remote" "$main"; then
+      :
+    elif g merge-base --is-ancestor "$main" "$remote"; then
+      before="$(g rev-parse "$main")" after="$(g rev-parse "$remote")"
+      holder="$(g worktree list --porcelain | awk -v b="branch refs/heads/$main" '/^worktree /{w=substr($0,10)} $0==b{print w; exit}')"
+      if [ -n "$holder" ]; then
+        git -C "$holder" merge -q --ff-only "$remote" >/dev/null 2>&1
+      else
+        g update-ref "refs/heads/$main" "$after" "$before"
+      fi
+      if [ "$(g rev-parse "$main")" = "$after" ]; then
+        echo "MAIN_UPDATED=$before..$after"
+      else
+        err "ローカルの $main を $remote に進められなかった（${holder:-ref の更新}）。$remote を取り込む"
+        target="$remote"
+      fi
+    else
+      echo "UPSTREAM_DIVERGED=$(g rev-parse "$main")...$(g rev-parse "$remote")"
+      err "ローカルの $main と $remote が分かれている。ローカルの $main を取り込んで続ける。origin を扱わせないなら GORI_IGNORE_UPSTREAM=1 を設定する"
+    fi
+  fi
+fi
+
+if g merge-base --is-ancestor "$target" HEAD; then
+  echo "UP_TO_DATE"
+  exit 0
+fi
+
+judged=0
+for sha in $(g rev-list "$target..HEAD"); do
+  if [ -d "$verdicts/$sha" ]; then judged=1 && break; fi
+done
+
+if [ "$judged" -eq 1 ]; then
+  g merge -q --no-edit "$target" >/dev/null 2>&1 && { echo "MERGED"; exit 0; }
+else
+  g rebase -q "$target" >/dev/null 2>&1 && { echo "REBASED"; exit 0; }
+fi
+conflicts="$(g diff --name-only --diff-filter=U)"
+if [ -z "$conflicts" ]; then
+  err "取り込みに失敗したが、衝突したファイルが無い。$dir の git status を確かめる"
+  exit 2
+fi
+echo "CONFLICT"
+printf '%s\n' "$conflicts"
+exit 1

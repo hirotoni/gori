@@ -1,0 +1,3 @@
+#!/bin/sh
+# 作業リポジトリが元から持つ pre-commit を呼ぶ（delegate）。
+exec "$(dirname "$0")/delegate" pre-commit "$@"

@@ -1,0 +1,301 @@
+#!/usr/bin/env node
+import { parseArgs } from '../lib/args.mjs';
+import { refuseIfAuto } from '../lib/auto.mjs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readFrontmatter } from '../lib/frontmatter.mjs';
+import { procedureSteps } from '../lib/steps.mjs';
+import { secretFields } from '../lib/secrets.mjs';
+import { unitPath } from '../lib/units.mjs';
+import { checkHumanQuote, squash } from '../lib/transcripts.mjs';
+import { COLUMNS, NEW_TASK_ID, SLUG, TASK_ID, TASK_ID_FORM, TYPES, appendAuditRow, auditPath, checkAudit, envSessionId, git, nowIso, parseAudit, newTaskId, resolveRepoDir, rowText, sanitize, verdictState } from '../lib/audit.mjs';
+
+const [sub, ...rest] = process.argv.slice(2);
+const { flags, positional } = parseArgs(rest, { value: ['task', 'slug', 'what', 'procedure', 'type', 'step', 'evidence', 'result', 'criterion', 'why', 'quote', 'repo', 'projects'], bool: ['json'] }, '使い方: log start|add|check|state（docs/design.md 参照）');
+
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+
+const repoDir = () => resolveRepoDir(flags.repo, flags.task);
+
+// 記録の場所は gori のチェックアウトの下（tools/lib/audit.mjs の goriDir）。決められなければ何も書かずに 2 で止まる。
+// write は書く道（start と add）が、書く直前に真にして呼ぶ。repo.yml が無ければ作る。
+function taskFile({ write = false } = {}) {
+  if (!flags.task || !TASK_ID.test(flags.task)) die(`--task には ${TASK_ID_FORM} の作業 ID を渡す`);
+  try {
+    return auditPath(repoDir(), flags.task, { write });
+  } catch (e) {
+    return die(e.message, 2);
+  }
+}
+
+function sessionId() {
+  return envSessionId() || '-';
+}
+
+function headInfo(repo) {
+  return { sha: git(repo, ['rev-parse', 'HEAD']), branch: git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']) };
+}
+
+const goriRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const REF_KEY = /^(procedures|criteria|skills|agents|config)\/[a-z0-9-]+$/;
+
+// 参照キーは gori の knowledge/ から、パスは作業リポジトリから解決する。
+// 手順書は、gori の知識ファイルの参照キーか、- （その場で書いた手順書を標準入力から読む）で渡す。
+// その場の手順書は start で手順を step 行に写せば役目を終えるので、ファイルに置かない（config/routing）。
+const STDIN = '-';
+function loadSteps(procedure) {
+  let path;
+  let text;
+  if (procedure === STDIN) {
+    path = '標準入力';
+    text = readFileSync(0, 'utf8');
+    if (!text.trim()) die('--procedure - には、その場で書いた手順書を標準入力で渡す', 1);
+  } else {
+    if (!REF_KEY.test(procedure)) die(`--procedure には手順書の参照キー（procedures/<id> など）か、標準入力から読む - を渡す（${procedure}）`, 2);
+    const rel = unitPath(goriRoot, procedure);
+    path = rel && join(goriRoot, rel);
+    if (!path || !existsSync(path)) die(`手順書 ${procedure} が見つからない`, 1);
+    text = readFileSync(path, 'utf8');
+  }
+  let lines = text.replace(/\r\n/g, '\n').split('\n');
+  let first = 1;
+  if (lines[0].trimEnd() === '---') {
+    const fm = readFrontmatter(text);
+    if (fm.error) die(`${path}: frontmatter を読めない: ${fm.error.message}`, 1);
+    lines = fm.bodyLines;
+    first = fm.bodyLine;
+  }
+  const { steps, error } = procedureSteps(lines, first);
+  if (error) die(`${path}:${error.line}: ${error.message}`, 1);
+  return steps;
+}
+
+// 新しく始める作業の作業 ID は、--slug から道具が今の時刻で発行する。--task は発行済みの新しい形の ID だけ受け付ける。
+const ISSUE = '新しく始める作業は --slug <slug> で道具に作業 ID を発行させる（<YYYYMMDD>-<hhmmss>-<slug>）';
+function startTask() {
+  if (flags.task !== undefined && flags.slug !== undefined) die(`--task と --slug は一緒に渡さない。${ISSUE}`);
+  if (flags.slug !== undefined) {
+    if (!SLUG.test(flags.slug)) die(`--slug は小文字英数字とハイフンで書く（${flags.slug}）`);
+    flags.task = newTaskId(flags.slug);
+  } else if (!flags.task) {
+    die(`--slug か --task を渡す。${ISSUE}`);
+  } else if (!NEW_TASK_ID.test(flags.task)) {
+    die(`start --task は <YYYYMMDD>-<hhmmss>-<slug> の作業 ID だけ受け付ける（${flags.task}）。${ISSUE}`);
+  }
+  return flags.task;
+}
+
+function start() {
+  const task = startTask();
+  const file = taskFile();
+  if (!flags.what) die('--what に作業の目的を渡す');
+  rejectSecrets({ '--what': flags.what });
+  // start 行の evidence は手順書の参照キー。標準入力の手順書は stdin、手順書が無ければ - と書く。
+  const procedure = flags.procedure === STDIN ? 'stdin' : (flags.procedure ?? '-');
+  if (existsSync(file)) {
+    const rows = parseAudit(readFileSync(file, 'utf8'));
+    const s = rows[1]?.row;
+    if (s?.type === 'start' && s.what === sanitize(flags.what) && s.evidence === (sanitize(procedure) || '-')) {
+      console.log(`${file}: 同じ内容の start が既にある`);
+      console.log(`TASK_ID=${task}`);
+      return;
+    }
+    die(`${file}: 既に存在する。別の作業 ID を使うか、log add で追記する`, 1);
+  }
+  const steps = flags.procedure ? loadSteps(flags.procedure) : [];
+  const repo = repoDir();
+  taskFile({ write: true });
+  mkdirSync(dirname(file), { recursive: true });
+  const time = nowIso();
+  // 作業を始めた時点の HEAD を残す。レビューの範囲の起点を、秒単位の時刻からの推測ではなく実物で決めるため。
+  const head = git(repo, ['rev-parse', '--verify', '-q', 'HEAD^{commit}']);
+  const lines = [COLUMNS.join('\t'), rowText('start', { what: flags.what, evidence: procedure, result: head ? `base=${head}` : '-' }, time, sessionId()), ...steps.map((s) => rowText('step', { step: s.n, what: s.text.replaceAll('${CLAUDE_PLUGIN_ROOT}', goriRoot) }, time, sessionId()))];
+  writeFileSync(file, `${lines.join('\n')}\n`);
+  console.log(file);
+  console.log(`TASK_ID=${task}`);
+}
+
+// log add が書く前に拒む検査の rule-id。enforced_by の log:<名前> はこの名前を指す。
+const DONE_UNJUDGED = 'done-unjudged';
+
+// commit を伴う作業は、作業ツリー（作業 ID のブランチの worktree か cwd）の HEAD の verdict check が 0 のときだけ done を書ける。
+// commit を伴う作業とは、HEAD が start 行に記録した base= から変わり、base..HEAD に main（無ければ master）に無い commit がある作業である。
+// 他の作業のマージで main だけが進んだ（本体のチェックアウトで調べている間にマージされた）作業は、commit の無い作業として扱う。
+// main も master も無いリポジトリでは、HEAD が base= から変わっていれば commit を伴う作業とする。
+// main の上で直接 commit した作業と、作業ブランチを先に main へ取り込んだ作業は、main に無い commit が 0 件になる。
+// そこで、作業ツリーの HEAD の reflog で start より後に commit を作った行の commit のうち、base..HEAD にあるものも自分の commit と数える。
+// 他の作業が main に入っただけなら、reflog には merge か fast-forward の行しか残らない。reflog が読めなければ、main に無い commit だけで決める。
+// マージは done の後の、作業の記録の外の操作である。マージした後の HEAD にはレビュー結果が無いので、done はマージの前に書く。
+// base= の無い記録（commit の無いリポジトリで始めた作業、base= を残す前の記録）は見分けられないので、今までどおり書ける。
+// commit を作る操作の reflog の行。merge と fast-forward、reset、checkout は commit を作らないか、他の作業の commit を持ち込む。
+const MAKES_COMMIT = /^(commit(?! \(merge\))|cherry-pick|revert|(rebase|pull)[^:]*\((pick|reword|edit|squash|fixup)\))/;
+function madeSince(repo, base, sha, startTime) {
+  const since = Math.floor(Date.parse(startTime) / 1000);
+  if (!Number.isFinite(since)) return 0;
+  const log = git(repo, ['reflog', 'show', '--date=unix', '--format=%H%x09%gd%x09%gs', 'HEAD']);
+  const range = git(repo, ['rev-list', `${base}..${sha}`]);
+  if (!log || range === null) return 0;
+  const inRange = new Set(range.split('\n').filter(Boolean));
+  const made = new Set();
+  for (const line of log.split('\n')) {
+    const [c, gd, gs] = line.split('\t');
+    const t = Number(/@\{(\d+)\}$/.exec(gd ?? '')?.[1]);
+    if (t >= since && MAKES_COMMIT.test(gs ?? '') && inRange.has(c)) made.add(c);
+  }
+  return made.size;
+}
+
+function checkDone(file, repo, head, rows) {
+  const base = /^base=([0-9a-f]{40})$/.exec(rows[1]?.row.type === 'start' ? rows[1].row.result : '')?.[1];
+  if (!base || head.sha === base) return;
+  if (!head.sha) die(`${file}: ${DONE_UNJUDGED}: ${repo} の HEAD を commit に解決できず、start の時点（base=${base.slice(0, 12)}）から変わったかを確かめられない`, 2);
+  // main の決め方は tools/records/review の main の確認と同じにしてある。
+  const mainBr = ['main', 'master'].find((b) => git(repo, ['rev-parse', '--verify', '-q', `refs/heads/${b}`]));
+  const own = git(repo, ['rev-list', '--count', `${base}..${head.sha}`, ...(mainBr ? ['--not', `refs/heads/${mainBr}`] : [])]);
+  if (own === null) die(`${file}: ${DONE_UNJUDGED}: ${repo} で start の時点（base=${base.slice(0, 12)}）からの commit を数えられない`, 2);
+  const made = own === '0' ? madeSince(repo, base, head.sha, rows[1].row.time) : 0;
+  if (own === '0' && made === 0) return;
+  const v = verdictState(repo, flags.task, head.sha, file);
+  if (v.code !== 0) {
+    const what = own !== '0' ? `${mainBr ?? 'main'} に無い commit が ${own} 件ある` : `reflog で start の後に自分が作った commit が ${made} 件ある（${mainBr ?? 'main'} の上にある）`;
+    die(`${file}: ${DONE_UNJUDGED}: 作業ツリー ${repo} の HEAD ${head.sha.slice(0, 12)} には start の時点（base=${base.slice(0, 12)}）から ${what}（commit を伴う作業）が、verdict check が ${v.code} である（${v.state}: ${v.reason}）。tools/records/review で HEAD のレビューを受け、verdict check --task ${flags.task} が 0 になってから done を書く。マージは done の後に行う`, 1);
+  }
+}
+
+// 秘密情報らしい文字列を含む欄があれば、書かずに終える。値そのものは出さない。
+function rejectSecrets(fields) {
+  const hits = secretFields(fields);
+  if (hits.length) die(`secret-like: ${hits.join('、')} に秘密情報らしい文字列がある。伏せるか言い換えて書き直す（記録は作業の後も残る）`);
+}
+
+function add() {
+  const file = taskFile();
+  const type = flags.type;
+  const ADDABLE = TYPES.filter((t) => t !== 'start' && t !== 'step');
+  if (!ADDABLE.includes(type)) die(`--type は ${ADDABLE.join(' | ')} のいずれか（step 行は log start --procedure だけが書く）`);
+  if ((type === 'step-done' || type === 'step-skip') && !flags.step) die(`--type ${type} には --step <番号> を渡す`);
+  if (type === 'step-skip' && !flags.why) die('step-skip には --why に飛ばす理由を渡す');
+  if (type === 'check') {
+    if (!flags.criterion) die("--type check には --criterion に指し（'行 N'、'行 N#k'、'承認'、'文書'）を渡す");
+    if (!/^(行 \d+(#\d+)?|承認|文書)$/.test(flags.criterion)) die(`--criterion は '行 N'、'行 N#k'、'承認'、'文書' のいずれか（${flags.criterion}）`);
+    if (!flags.evidence) die('--type check には --evidence に点検したコマンドと出力の要点を渡す');
+  } else if (!flags.what && type !== 'step-done' && type !== 'step-skip') die('--what を渡す');
+  // 無人の作業には人間の発言が無いので、承認の行を書かせない（docs/design.md の「自律起動」）。
+  if (type === 'approval') refuseIfAuto('承認の行（log add --type approval）の記録');
+  if (!existsSync(file)) die(`${file}: 無い。先に log start を実行する`, 1);
+  rejectSecrets({ '--what': flags.what, '--why': flags.why, '--evidence': flags.evidence, '--result': flags.result, '--quote': flags.quote });
+  taskFile({ write: true });
+  const text = readFileSync(file, 'utf8');
+  const rows = parseAudit(text);
+  const repo = repoDir();
+  const f = { ...flags };
+  const head = headInfo(repo);
+  if (type === 'step-done' || type === 'step-skip') {
+    f.what ??= rows.find((r) => r.row.type === 'step' && r.row.step === sanitize(flags.step))?.row.what;
+  }
+  if (type === 'pause') {
+    const dirty = (git(repo, ['status', '--porcelain']) ?? '').split('\n').filter(Boolean).length;
+    f.evidence = `${flags.evidence ?? ''} sha=${head.sha ?? '-'} branch=${head.branch ?? '-'} dirty=${dirty}`.trim();
+  }
+  if (type === 'approval') f.evidence = approvalEvidence();
+  // check 行の指しは what に、点検した commit は result に置く。レビューする commit の check 行だけを review が数える。
+  if (type === 'check') {
+    if (!head.sha) die(`${repo} の HEAD を commit に解決できない。点検した commit を result に残せない`);
+    f.what = flags.criterion;
+    f.result = head.sha;
+  }
+  if (type === 'resume' && !flags.evidence) {
+    const pause = rows.findLast((r) => r.row.type === 'pause');
+    const recorded = /sha=(\S+)/.exec(pause?.row.evidence ?? '')?.[1];
+    f.evidence = `記録 sha=${recorded ?? '-'} 現在 sha=${head.sha ?? '-'} ${recorded && recorded === head.sha ? '一致' : '不一致'}`;
+  }
+  // done 済みの記録への追記は、下の appendAuditRow が after-done で拒む。その違反を done-unjudged より先に見せるため、done 済みなら検査しない。
+  if (type === 'done' && !rows.some((r) => r.row.type === 'done')) checkDone(file, repo, head, rows);
+  const res = appendAuditRow(file, type, f, sessionId());
+  if (res.violations.length) {
+    for (const v of res.violations) console.error(`${file}:${v.line}: ${v.rule}: ${v.message}`);
+    process.exit(1);
+  }
+  console.log(`${file}:${res.line}`);
+}
+
+// 承認の行は、人間の承認を残す。会話の中から書くときは、担当が案に番号を振って示し、人間の返事から承認の言葉を切り出して --quote に渡す（複数の問いに答えた返事なら全文を渡す。skills/decision-log）。
+// 道具が確かめるのは、引用が今の会話の最後の人間の入力に含まれること（checkHumanQuote）だけである。返事が案を変える指示でないかは、担当が読み、レビュアーが確かめる。
+// セッション ID の環境変数が無ければ、端末の人間が自分で書いていると見なし、照合しない（レビュー結果の verdict record と同じ扱い）。
+function approvalEvidence() {
+  const session = envSessionId();
+  if (!session) {
+    const quote = squash(flags.quote);
+    return quote ? `端末の人間 「${quote}」` : '端末の人間';
+  }
+  if (!squash(flags.quote)) die('--type approval には --quote に、人間の返事から切り出した承認の言葉を渡す（複数の問いに答えた返事なら全文を渡す）');
+  const r = checkHumanQuote(flags.quote, { session, projects: flags.projects, questions: false });
+  if (r.rule) die(`approval-${r.rule}: ${r.reason}。承認の返事をもう一度送ってもらうか、人間に端末から書いてもらう`);
+  return r.evidence;
+}
+
+function check() {
+  const file = positional[0];
+  if (!file) die('log check <file>');
+  if (!existsSync(file)) die(`${file}: 無い`);
+  const violations = checkAudit(readFileSync(file, 'utf8'));
+  for (const v of violations) console.log(`${file}:${v.line}: ${v.rule}: ${v.message}`);
+  if (violations.length) {
+    console.error(`${violations.length} 件の違反`);
+    process.exit(1);
+  }
+  console.log(`${file}: OK`);
+}
+
+function state() {
+  const file = taskFile();
+  if (!existsSync(file)) die(`${file}: 無い`, 1);
+  const rows = parseAudit(readFileSync(file, 'utf8')).slice(1);
+  const repo = repoDir();
+  const head = headInfo(repo);
+  const view = (r) => ({ line: r.line, ...r.row });
+  const pauseIdx = rows.findLastIndex((r) => r.row.type === 'pause');
+  const pause = pauseIdx >= 0 ? view(rows[pauseIdx]) : null;
+  const recorded = pause ? /sha=(\S+)/.exec(pause.evidence)?.[1] ?? null : null;
+  const recordedBranch = pause ? /branch=(\S+)/.exec(pause.evidence)?.[1] ?? null : null;
+  const settled = new Set(rows.filter((r) => r.row.type === 'step-done' || r.row.type === 'step-skip').map((r) => r.row.step));
+  const remainingSteps = rows.filter((r) => r.row.type === 'step' && !settled.has(r.row.step)).map((r) => ({ step: r.row.step, what: r.row.what }));
+  const body = (pauseIdx >= 0 ? rows.slice(pauseIdx + 1) : rows.slice(1)).filter((r) => r.row.type !== 'step');
+  const out = {
+    task: flags.task,
+    file,
+    start: rows[0] ? view(rows[0]) : null,
+    done: rows.some((r) => r.row.type === 'done'),
+    pause,
+    remainingSteps,
+    after: body.map(view),
+    recordedSha: recorded,
+    recordedBranch,
+    head,
+    shaMatch: recorded ? recorded === head.sha : null,
+  };
+  if (flags.json) return console.log(JSON.stringify(out, null, 2));
+  const L = [];
+  L.push(`作業: ${out.task}`, `目的: ${out.start?.what ?? '-'}`, `完了: ${out.done ? 'done 済み（追記不可）' : 'いいえ'}`);
+  if (pause) {
+    L.push(`最後の pause（${pause.line} 行目、session ${pause.session}）`, `  次の手順: ${pause.what}`, `  中断の理由: ${pause.why}`, `  証拠: ${pause.evidence}`, `  未完了: ${pause.result}`);
+    L.push(out.shaMatch ? `SHA: 一致（${head.sha}）` : `SHA: 不一致。記録 ${recorded ?? '-'}（${recordedBranch ?? '-'}）、現在 ${head.sha ?? '-'}（${head.branch ?? '-'}）。実物を確かめてから進める`);
+  } else L.push('pause 行は無い');
+  if (rows.some((r) => r.row.type === 'step')) {
+    L.push('残りの手順（step-done でも step-skip でもないもの）:');
+    for (const s of remainingSteps) L.push(`  ${s.step}. ${s.what}`);
+    if (remainingSteps.length === 0) L.push('  なし');
+  }
+  L.push(pause ? 'pause 以降の行:' : '全データ行（start を除く）:');
+  for (const r of out.after) L.push(`  ${r.line}: ${r.time} ${r.type} step=${r.step} ${r.what}`);
+  if (out.after.length === 0) L.push('  なし');
+  console.log(L.join('\n'));
+}
+
+const cmds = { start, add, check, state };
+if (!cmds[sub]) die('使い方: log start|add|check|state（docs/design.md 参照）');
+cmds[sub]();

@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// 手順書の候補（skills/procedure-scout）の材料を、全リポジトリの判断の記録から集める。設計は docs/design.md の「手順書の候補」にある。
+// 出すのは、その場で書いた手順書で始めた作業（start の evidence が stdin）と、step-skip が一つ以上ある作業で、一行一件の JSON にする。
+// 拾うか、どう分けるかは能力が決めるので、ここでは絞らない。記録は読むだけで書かない。
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { RecordsError, parseAudit, recordsGori } from '../lib/audit.mjs';
+import { PoolError, reposDir } from '../lib/pool.mjs';
+
+const USAGE = '使い方: procedure-material（引数なし）';
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+const args = process.argv.slice(2);
+if (args.length === 1 && (args[0] === '-h' || args[0] === '--help')) {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (args.length) die(`procedure-material: 引数を受け付けない: ${args.join(' ')}\n${USAGE}`);
+
+let root;
+try {
+  root = reposDir(recordsGori());
+} catch (e) {
+  if (e instanceof RecordsError || e instanceof PoolError) die(e.message);
+  throw e;
+}
+const dirs = (d) => (existsSync(d) ? readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort() : []);
+
+for (const repo of dirs(root)) {
+  const audit = join(root, repo, 'audit');
+  if (!existsSync(audit)) continue;
+  for (const f of readdirSync(audit).filter((n) => n.endsWith('.tsv')).sort()) {
+    const rows = parseAudit(readFileSync(join(audit, f), 'utf8')).slice(1).map((r) => r.row);
+    const start = rows.find((r) => r.type === 'start');
+    if (!start) continue;
+    const stdin = start.evidence === 'stdin';
+    const text = new Map(rows.filter((r) => r.type === 'step').map((r) => [r.step, r.what]));
+    const skips = rows.filter((r) => r.type === 'step-skip').map((r) => ({ step: r.step, text: text.get(r.step) ?? r.what ?? '', why: r.why ?? '' }));
+    if (!stdin && skips.length === 0) continue;
+    const out = { repo, task: f.slice(0, -'.tsv'.length), time: start.time, what: start.what, procedure: start.evidence };
+    if (stdin) out.steps = [...text.values()];
+    out.skips = skips;
+    console.log(JSON.stringify(out));
+  }
+}

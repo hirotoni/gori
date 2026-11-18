@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+// 一つの作業の記録を時系列の JSONL に並べる。何も書き換えない。
+// 会話の記録は退避されず消えるので、無くても判断の記録とレビュー結果からの経過は出す。
+// commit は出さない。履歴を畳むと古い commit は読めなくなるので、作業が終わった後に commit を git に問い合わせない。
+import { parseArgs } from '../lib/args.mjs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, relative, resolve } from 'node:path';
+import { COLUMNS, TASK_ID, TASK_ID_FORM, auditPath, auditSpan, goriDir, humanWindow, parseAudit, resolveRepoDir, validTime } from '../lib/audit.mjs';
+import { readLines, withBefore } from '../lib/transcripts.mjs';
+
+const { flags, positional } = parseArgs(process.argv.slice(2), { value: ['repo', 'projects'], bool: ['text'] }, '使い方: trace <作業ID> [--repo <dir>] [--projects <dir>] [--text]');
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+
+const task = positional[0];
+if (!task || !TASK_ID.test(task)) die(`使い方: trace <作業ID> [--repo <dir>] [--projects <dir>] [--text]（作業 ID は ${TASK_ID_FORM}）`);
+const repo = resolveRepoDir(flags.repo, task);
+const projects = resolve(flags.projects ?? join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects'));
+let auditFile;
+try {
+  auditFile = auditPath(repo, task);
+} catch (e) {
+  die(e.message, 2);
+}
+if (!existsSync(auditFile)) die(`${auditFile}: 判断の記録が無い。作業の経過は推測しない`);
+
+const rows = [];
+const add = (time, source, kind, text, ref, extra = {}) => rows.push({ time, source, kind, text, ref, ...extra });
+const clip = (s, n = 300) => (s.length > n ? `${s.slice(0, n)}…` : s);
+// 記録の場所は、記録を置く gori のチェックアウトの git の共通ディレクトリからの相対（gori/repos/<名前>/...）で示す。
+// goriDir は <共通ディレクトリ>/gori/repos/<名前> なので、三つ上がその共通ディレクトリである。
+const recRoot = resolve(goriDir(repo), '..', '..', '..');
+const rel = (p) => relative(recRoot, p);
+
+// 判断の記録
+const auditRel = rel(auditFile);
+const parsed = parseAudit(readFileSync(auditFile, 'utf8'));
+// start、done、セッションの決め方は、sessions human --outside-tasks と同じ auditSpan に揃える。
+const { sessions } = auditSpan(parsed);
+let firstTime = null;
+let lastTime = null;
+if (parsed[0]?.raw !== COLUMNS.join('\t')) add(null, 'meta', 'unreadable', '一行目が列名の行でない', { file: auditRel, line: 1 });
+for (const r of parsed.slice(1)) {
+  const ref = { file: auditRel, line: r.line };
+  if (r.cells.length !== COLUMNS.length) {
+    add(lastTime, 'meta', 'unreadable', `列数が ${r.cells.length} である`, ref);
+    continue;
+  }
+  if (!validTime(r.row.time)) {
+    add(lastTime, 'meta', 'unreadable', `time「${r.row.time}」を読めない`, ref);
+    continue;
+  }
+  lastTime = r.row.time;
+  firstTime ??= r.row.time;
+  const text = r.row.type === 'step-skip' ? `${r.row.what}（飛ばす理由: ${r.row.why}）` : r.row.what;
+  // start 行は、作業を始めた手順書（procedures/<id>、その場で書いたものは - か stdin）を procedure に出す。metrics が step-skip を手順書ごとに数えるためである。
+  const extra = r.row.type === 'start' ? { procedure: r.row.evidence } : {};
+  add(r.row.time, 'audit', r.row.type, text, ref, { session: r.row.session, step: r.row.step, ...extra });
+}
+// 先頭で時刻の無かった meta は最初の時刻に寄せる。
+for (const r of rows) if (r.time === null) r.time = firstTime;
+
+// レビュー結果。別の作業のレビュー結果は出さない。
+const vroot = join(goriDir(repo), 'verdicts');
+if (existsSync(vroot)) {
+  for (const d of readdirSync(vroot).sort()) {
+    const dir = join(vroot, d);
+    if (!statSync(dir).isDirectory()) continue;
+    for (const f of readdirSync(dir).filter((n) => n.endsWith('.json')).sort()) {
+      const file = join(dir, f);
+      let v;
+      try {
+        v = JSON.parse(readFileSync(file, 'utf8'));
+      } catch {
+        add(firstTime, 'meta', 'unreadable', 'レビュー結果の JSON を読めない', { file: rel(file) });
+        continue;
+      }
+      if (v.task !== task) continue;
+      const body = (v.findings?.length ? v.findings : v.evidence) ?? [];
+      add(validTime(v.time) ? v.time : firstTime, 'verdict', v.result, clip(body.join(' / ')), { file: rel(file), sha: v.sha ?? d }, { judge: v.judge, weight: v.weight ?? 'normal' });
+    }
+  }
+}
+
+// 会話の記録の中の人間の発言
+function* jsonlFiles(dir) {
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) yield* jsonlFiles(p);
+    else if (name.endsWith('.jsonl')) yield p;
+  }
+}
+const transcripts = new Map();
+for (const p of jsonlFiles(projects)) {
+  const id = p.slice(p.lastIndexOf('/') + 1, -'.jsonl'.length);
+  if (!transcripts.has(id)) transcripts.set(id, p);
+}
+// 発言を拾う期間は humanWindow が決める。done の後の発言は、同じセッションで次に始まった別の作業の start の直前まで拾う。無ければ会話の記録の終わりまで。
+for (const sid of [...sessions].sort()) {
+  const { from: humanFrom, to: humanEnd, doneMs } = humanWindow(repo, task, sid);
+  const file = transcripts.get(sid);
+  if (!file) {
+    add(firstTime, 'meta', 'transcript-missing', `セッション ${sid} の会話の記録が無い`, { session: sid });
+    continue;
+  }
+  // 人間の発言の見分け方と、直前のエージェントの発言（before）の添え方は sessions human と同じ tools/lib/transcripts.mjs に揃える。
+  for (const { o, text: t, before } of withBefore(readLines(file))) {
+    // start より前、または同じセッションの次の作業の start 以後の発言は別の作業のものなので拾わない。
+    if (!validTime(o.timestamp)) continue;
+    const ms = Date.parse(o.timestamp);
+    if (ms < humanFrom || ms > humanEnd) continue;
+    add(o.timestamp, 'human', 'message', t, { session: sid, message: o.uuid }, { ...(ms > doneMs ? { afterDone: true } : {}), ...(before ? { before } : {}) });
+  }
+}
+
+const out = rows.map((r, i) => ({ r, i })).sort((a, b) => (Date.parse(a.r.time) || 0) - (Date.parse(b.r.time) || 0) || a.i - b.i).map((x) => x.r);
+if (flags.text) {
+  const one = (s) => String(s ?? '').replace(/\s+/g, ' ');
+  for (const r of out) console.log(`${r.time}  ${r.source}/${r.kind}${r.afterDone ? '(done後)' : ''}  ${clip(one(r.text), 200)}`);
+} else {
+  for (const r of out) console.log(JSON.stringify(r));
+}

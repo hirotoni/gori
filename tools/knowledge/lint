@@ -1,0 +1,319 @@
+#!/usr/bin/env node
+import { existsSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { PATTERN, loadCases, treeLearningDir } from '../lib/learning.mjs';
+import { procedureSteps } from '../lib/steps.mjs';
+import { caseKeys, discoverUnits, loadUnit, mentions, parseRootArg } from '../lib/units.mjs';
+
+const REQUIRED_SECTIONS = ['対象', '手順', '禁止事項', '終わりの条件', '報告'];
+const MIN_PARAGRAPH = 40;
+
+// この道具が出す rule-id の表。enforced_by の lint:<rule-id> はこの表で解決する。
+const RULES = [
+  'bad-frontmatter', 'missing-field', 'bad-value', 'id-mismatch', 'kind-mismatch',
+  'unresolved-ref', 'unmentioned-ref', 'unlisted-ref', 'procedure-sections', 'procedure-steps',
+  'uninvocable-trigger', 'duplicated-paragraph',
+  'unknown-enforcer', 'pool-provenance',
+];
+
+// enforced_by の各項目は <種類>:<名前> の形で書き、種類ごとに次の規則で実在を確かめる。
+// lint: この道具の rule-id（上の RULES）。
+// test: --root の tests/ の下（fixtures を除く）にある <名前>.test.mjs か <名前>.sh。
+// verdict、log: 道具が名前で返す検査。道具の中の名前と食い違わないことは tests/knowledge/lint.test.mjs が確かめる。
+const ENFORCERS = {
+  lint: { what: 'tools/knowledge/lint の rule-id', names: () => RULES },
+  test: { what: 'tests/ の下の <名前>.test.mjs か <名前>.sh', names: () => testNames() },
+  verdict: { what: 'tools/records/verdict の検査', names: () => ['check', 'not-judge', 'dirty-tree', 'self-judgment'] },
+  log: { what: 'tools/records/log の検査', names: () => ['check', 'done-unjudged'] },
+};
+
+// 来歴は事例の id を持たず、学びの pattern を provenance.patterns に持つ（docs/design.md の 2 章「事例と来歴」）。
+// 事例はマシンの手元にしかないので、id を書くと自分の事例を持つ別のマシンで指す先が無い。
+// 来歴は改善候補のプールの一件を指さない（docs/design.md の 2 章）。プールは手元にしかなく commit されないので、別のマシンでは指す先が無い。
+// プールの無いマシンでも落とせるよう、プールの有無に依らず書き方（pool:<ID> か、一件の ID の形 <YYYYMMDD>-<hhmmss>-<slug>）で見分ける。
+// 「学び: <pattern>」はその形を含みうるので、その形を除いてから見る。patterns の各要素は pattern の形でもあるので、そのまま見る。
+const POOL_REF = /pool:|\b\d{8}-\d{6}-[a-z0-9]/i;
+const LEARNED_SOURCE = /^学び: [a-z0-9]+(-[a-z0-9]+)*/;
+
+const rootArg = process.argv.includes('--root') ? parseRootArg(process.argv) : null;
+if (process.argv.includes('--root') && !rootArg) {
+  console.error('--root にはディレクトリを渡す');
+  process.exit(2);
+}
+const root = resolve(rootArg ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+
+const violations = [];
+const report = (path, line, rule, message) => {
+  if (!RULES.includes(rule)) throw new Error(`rule-id ${rule} が RULES の表に無い`);
+  violations.push({ path, line, rule, message });
+};
+
+let testNamesCache = null;
+function testNames() {
+  if (testNamesCache) return testNamesCache;
+  testNamesCache = [];
+  const walk = (dir) => {
+    if (!existsSync(dir)) return;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (e.name !== 'fixtures' && !e.name.startsWith('.')) walk(join(dir, e.name));
+      } else {
+        const m = /^(.+?)(\.test\.mjs|\.sh)$/.exec(e.name);
+        if (m) testNamesCache.push(m[1]);
+      }
+    }
+  };
+  walk(join(root, 'tests'));
+  return testNamesCache;
+}
+
+// provenance.cases を見つけたときの直し方。上流から欲しいところだけを取り込んで古い形の知識ファイルが残ったマシンが、そのまま置き換えられるようにする。
+// 手元の事例（--root の git の共通ディレクトリの下の gori/learning/cases/）から id の pattern を引き、置き換えた後の行を示す。
+// 事例を読むのはこの出力のためだけで、合否には使わない（件数は学びを適用するときに数える）。
+let localCases;
+function casesFix(p) {
+  const ids = p.cases.type === 'list' ? [...new Set(p.cases.value)] : [];
+  const kept = p.patterns?.type === 'list' ? p.patterns.value : [];
+  if (ids.length === 0) return `cases の行を消し、patterns: [${kept.join(', ')}] にする`;
+  if (localCases === undefined) localCases = treeLearningDir(root) ? new Map(loadCases(root).map((c) => [c.id, c])) : null;
+  if (!localCases) return '手元に事例が無いので、事例を持つマシンの tools/learning/case list で id から pattern を引く';
+  const found = ids.filter((id) => localCases.has(id) && !localCases.get(id).retracted);
+  const missing = ids.filter((id) => !localCases.has(id));
+  const retracted = ids.filter((id) => localCases.get(id)?.retracted);
+  const patterns = [...new Set([...kept, ...found.map((id) => localCases.get(id).pattern).filter((v) => PATTERN.test(v))])];
+  const notes = [
+    ...(missing.length ? [`手元に無い id: ${missing.join(', ')}（事例を持つマシンの tools/learning/case list で pattern を引いて足す）`] : []),
+    ...(retracted.length ? [`取り消した id: ${retracted.join(', ')}（根拠に数えないので足さない）`] : []),
+  ];
+  return `cases の行を消し、patterns: [${patterns.join(', ')}] にする${notes.length ? `。${notes.join('。')}` : ''}`;
+}
+
+const units = discoverUnits(root);
+const known = new Set([...units.map((u) => u.key), ...caseKeys(root)]);
+
+// rule が無いときの直し方。rule を持つ前の判断基準は、規則を本体の冒頭の一文に書いていた（docs/design.md の 2 章「判断基準の規則」）。
+// 上流から欲しいところだけを取り込んで古い形の判断基準が残ったマシンが、そのまま置き換えられるようにする。
+function ruleFix(u) {
+  const first = u.bodyLines.find((l) => l.trim() !== '')?.trim() ?? '';
+  const sentence = /^(#|[-*+] |\d+\. |\||>|```|~~~)/.test(first) ? '' : (/^[^。]*。/.exec(first)?.[0] ?? '');
+  if (!sentence) return '規則を一文か二文で、frontmatter に rule: <規則> の一行で書く';
+  return `本体の冒頭の一文を frontmatter に移し、本体からその一文を消す。足す行: rule: ${sentence}`;
+}
+
+function checkFields(u) {
+  const f = u.fields;
+  const need = (name, node, type) => {
+    if (!node) {
+      report(u.path, 1, 'missing-field', `必須項目 ${name} がない`);
+      return false;
+    }
+    if (node.type !== type) {
+      report(u.path, node.line, 'bad-value', `${name} は ${type === 'list' ? 'リスト' : type === 'map' ? '入れ子の map' : '文字列'}でなければならない`);
+      return false;
+    }
+    return true;
+  };
+  const nonEmpty = (name, node) => {
+    if (need(name, node, 'scalar') && node.value.trim() === '') {
+      report(u.path, node.line, 'bad-value', `${name} が空`);
+    }
+  };
+
+  if (need('id', f.id, 'scalar') && f.id.value !== u.id) {
+    report(u.path, f.id.line, 'id-mismatch', `id「${f.id.value}」がファイル名から決まる id「${u.id}」と一致しない`);
+  }
+  if (need('kind', f.kind, 'scalar') && f.kind.value !== u.kind) {
+    report(u.path, f.kind.line, 'kind-mismatch', `kind「${f.kind.value}」が置き場所の種類「${u.kind}」と一致しない`);
+  }
+  need('refs', f.refs, 'list');
+
+  if (need('provenance', f.provenance, 'map')) {
+    const p = f.provenance.value;
+    if (need('provenance.added', p.added, 'scalar')) {
+      const d = p.added.value;
+      const t = Date.parse(`${d}T00:00:00Z`);
+      const valid = /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(t) && new Date(t).toISOString().startsWith(d);
+      if (!valid) report(u.path, p.added.line, 'bad-value', `provenance.added「${d}」は実在する YYYY-MM-DD でない`);
+    }
+    nonEmpty('provenance.source', p.source);
+    if (p.cases) report(u.path, p.cases.line, 'bad-value', `provenance.cases は使わない。事例の id は手元にしかなく別のマシンでは指す先が無いので、学びの pattern を provenance.patterns に書く。${casesFix(p)}`);
+    if (need('provenance.patterns', p.patterns, 'list')) {
+      for (const v of p.patterns.value) {
+        if (!PATTERN.test(v)) report(u.path, p.patterns.line, 'bad-value', `provenance.patterns の「${v}」は pattern の形（小文字英数字とハイフン）でない`);
+      }
+    }
+    need('provenance.enforced_by', p.enforced_by, 'list');
+  }
+
+  if (f.provenance?.type === 'map') checkProvenance(u, f.provenance.value);
+
+  if (u.kind === 'procedure' || u.kind === 'criterion') nonEmpty('when', f.when);
+  // 判断基準の規則は索引に載り、毎回文脈に入る（criteria/harness-shape）。
+  if (u.kind === 'criterion') {
+    if (f.rule) nonEmpty('rule', f.rule);
+    else report(u.path, 1, 'missing-field', `必須項目 rule がない。${ruleFix(u)}`);
+  }
+  if (u.kind === 'capability' || u.kind === 'role') {
+    if (need('name', f.name, 'scalar') && f.name.value !== u.id) {
+      report(u.path, f.name.line, 'id-mismatch', `name「${f.name.value}」が id「${u.id}」と一致しない`);
+    }
+    nonEmpty('description', f.description);
+  }
+
+  if (f.refs?.type === 'list') {
+    for (const ref of f.refs.value) {
+      if (!known.has(ref)) report(u.path, f.refs.line, 'unresolved-ref', `参照 ${ref} が実在する知識ファイルを指していない`);
+    }
+  }
+}
+
+function checkProvenance(u, p) {
+  const values = [
+    ...(p.source?.type === 'scalar' ? [['source', p.source.value, p.source.line, p.source.value.replace(LEARNED_SOURCE, '')]] : []),
+    ...(p.patterns?.type === 'list' ? p.patterns.value.map((v) => ['patterns', v, p.patterns.line, v]) : []),
+  ];
+  for (const [name, value, line, rest] of values) {
+    if (POOL_REF.test(rest)) {
+      report(u.path, line, 'pool-provenance', `provenance.${name} の「${value}」がプールの一件を指している。プールは手元にしかなく commit されないので、来歴はプールを参照しない。patterns には学びの pattern を、学びから作る知識ファイルの source には「学び: <pattern>」を書く`);
+    }
+  }
+
+  if (p.enforced_by?.type === 'list') {
+    for (const item of p.enforced_by.value) {
+      const m = /^([a-z]+):(.+)$/.exec(item);
+      const kind = m && Object.hasOwn(ENFORCERS, m[1]) ? ENFORCERS[m[1]] : null;
+      if (!kind) {
+        report(u.path, p.enforced_by.line, 'unknown-enforcer', `enforced_by の ${item} は <種類>:<名前> の形でない、または種類が ${Object.keys(ENFORCERS).join(' | ')} のいずれでもない`);
+      } else if (!kind.names().includes(m[2])) {
+        report(u.path, p.enforced_by.line, 'unknown-enforcer', `enforced_by の ${item} が実在する検査を指していない（${m[1]}: は ${kind.what} を指す）`);
+      }
+    }
+  }
+}
+
+function scanBody(u) {
+  const headings = [];
+  const paragraphs = [];
+  let fence = null;
+  let current = null;
+  const flush = () => {
+    if (current) {
+      const text = current.lines.join(' ').replace(/\s+/g, ' ').trim();
+      if ([...text].length >= MIN_PARAGRAPH) paragraphs.push({ text, line: current.line });
+    }
+    current = null;
+  };
+  u.bodyLines.forEach((raw, idx) => {
+    const line = u.bodyLine + idx;
+    const fenceMark = /^\s*(```|~~~)/.exec(raw);
+    if (fenceMark) {
+      flush();
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      return;
+    }
+    if (fence !== null) return;
+    if (raw.trim() === '') return flush();
+    const h = /^##\s+(.+?)\s*$/.exec(raw);
+    if (h) headings.push({ title: h[1], line });
+    if (!current) current = { line, lines: [] };
+    current.lines.push(raw.trim());
+  });
+  flush();
+  return { headings, paragraphs };
+}
+
+function checkSections(u, headings) {
+  const seen = [];
+  for (const h of headings) {
+    if (!REQUIRED_SECTIONS.includes(h.title)) continue;
+    if (seen.some((s) => s.title === h.title)) {
+      report(u.path, h.line, 'procedure-sections', `見出し「## ${h.title}」が二度以上ある`);
+    } else {
+      seen.push(h);
+    }
+  }
+  for (const title of REQUIRED_SECTIONS) {
+    if (!seen.some((s) => s.title === title)) {
+      report(u.path, u.bodyLine, 'procedure-sections', `見出し「## ${title}」がない`);
+    }
+  }
+  const order = seen.map((s) => REQUIRED_SECTIONS.indexOf(s.title));
+  for (let i = 1; i < order.length; i++) {
+    if (order[i] < order[i - 1]) {
+      report(u.path, seen[i].line, 'procedure-sections', `見出し「## ${seen[i].title}」が「## ${seen[i - 1].title}」より後ろにある（順序は ${REQUIRED_SECTIONS.join('、')}）`);
+    }
+  }
+}
+
+// disable-model-invocation: true の能力は Skill ツールで呼べず、人間がスラッシュコマンドで起動する。
+// 見るのは config/triggers の表の行だけである。triggers は能力を既定で Skill ツールで呼ぶと書くので、
+// 呼べない能力を名指す行には起動の仕方を書かせる。他の知識ファイルの文や表の外の文は見ない。
+// 行が /gori:<id> を含めば通す。起動の仕方として正しく書いてあるかまでは確かめない。
+function checkTriggers(u, uninvocable) {
+  let fence = null;
+  u.bodyLines.forEach((raw, idx) => {
+    const fenceMark = /^\s*(```|~~~)/.exec(raw);
+    if (fenceMark) {
+      if (fence === null) fence = fenceMark[1];
+      else if (fence === fenceMark[1]) fence = null;
+      return;
+    }
+    if (fence !== null || !raw.trimStart().startsWith('|')) return;
+    for (const key of uninvocable) {
+      const id = key.slice('skills/'.length);
+      if (mentions(raw, key) && !mentions(raw, `/gori:${id}`)) {
+        report(u.path, u.bodyLine + idx, 'uninvocable-trigger', `${key} は disable-model-invocation: true で Skill ツールでは呼べない。同じ行に起動の仕方（/gori:${id}）を書く`);
+      }
+    }
+  });
+}
+
+const loaded = units.map((unit) => loadUnit(root, unit));
+const uninvocable = loaded.filter((u) => u.kind === 'capability' && !u.error && u.fields['disable-model-invocation']?.value === 'true').map((u) => u.key);
+
+const firstSeen = new Map();
+for (const u of loaded) {
+  if (u.error) {
+    report(u.path, u.error.line, 'bad-frontmatter', `frontmatter を読めない: ${u.error.message}`);
+    continue;
+  }
+  checkFields(u);
+  const { headings, paragraphs } = scanBody(u);
+  if (u.kind === 'procedure') {
+    checkSections(u, headings);
+    if (headings.some((h) => h.title === '手順')) {
+      const { error } = procedureSteps(u.bodyLines, u.bodyLine);
+      if (error) report(u.path, error.line, 'procedure-steps', error.message);
+    }
+  }
+  if (u.key === 'config/triggers') checkTriggers(u, uninvocable);
+  if (u.fields.refs?.type === 'list') {
+    const body = u.bodyLines.join('\n');
+    for (const ref of u.fields.refs.value) {
+      if (known.has(ref) && !mentions(body, ref)) report(u.path, u.fields.refs.line, 'unmentioned-ref', `refs の ${ref} が本文のどこにも現れない。本文で名指しするか、refs から外す`);
+    }
+    // 逆向き。本文で名指した知識ファイルが refs に無いと、show が参照先を一緒に出さない。
+    for (const other of units) {
+      if (other.key !== u.key && !u.fields.refs.value.includes(other.key) && mentions(body, other.key)) report(u.path, u.fields.refs.line, 'unlisted-ref', `本文が名指す ${other.key} が refs に無い。refs に足す`);
+    }
+  }
+  const reportedPairs = new Set();
+  for (const p of paragraphs) {
+    const prior = firstSeen.get(p.text);
+    if (prior && prior.path !== u.path && !reportedPairs.has(prior.path)) {
+      reportedPairs.add(prior.path);
+      report(u.path, p.line, 'duplicated-paragraph', `${prior.path}（${prior.line} 行目）と同じ段落を書き写している。書き写さず参照（refs）で組み合わせる`);
+    }
+    if (!prior) firstSeen.set(p.text, { path: u.path, line: p.line });
+  }
+}
+
+violations.sort((a, b) => (a.path === b.path ? a.line - b.line : a.path < b.path ? -1 : 1));
+for (const v of violations) console.log(`${v.path}:${v.line}: ${v.rule}: ${v.message}`);
+if (violations.length > 0) {
+  console.error(`${violations.length} 件の違反`);
+  process.exit(1);
+}
+console.log(`lint: 知識ファイル ${units.length} 件 OK`);

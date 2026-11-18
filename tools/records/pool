@@ -1,0 +1,316 @@
+#!/usr/bin/env node
+// 改善候補、学び、手順書の候補のプールを読み書きする道具。設計は docs/design.md にある。
+// プールは gori のチェックアウトの git の共通ディレクトリの下の gori/repos/<名前>/pool/ に、一件一ファイルで置く。
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { envSessionId, nowIso } from '../lib/audit.mjs';
+import { checkHumanQuote, squash } from '../lib/transcripts.mjs';
+import { refuseIfAuto } from '../lib/auto.mjs';
+import { secretFields } from '../lib/secrets.mjs';
+import {
+  KINDS,
+  PoolError,
+  SLUG,
+  STATUSES,
+  TASK_REF,
+  alignRows,
+  commitOnMain,
+  goriCheckout,
+  idStamp,
+  itemPath,
+  listField,
+  loadItems,
+  missingHeadings,
+  parseItem,
+  prependToCurrent,
+  readItem,
+  reposDir,
+  resolvePool,
+  runGit,
+  serializeItem,
+  writeItem,
+} from '../lib/pool.mjs';
+
+const USAGE = `使い方:
+  pool add --kind learning|improvement|procedure --slug <slug> --title <題> [--pattern <p>] [--case <事例id>]... [--work-kind <種類>] [--task <リポジトリ>/<作業ID>]... [--file <パス>]... [--recurrence-of <ID>]  （本文は標準入力）
+  pool add-case <ID> <事例id>
+  pool todo <ID>
+  pool reject <ID> --why <理由> [--quote <人間の発言>]  （人間が決める。Claude Code の中からは、却下を頼んだ人間の発言を --quote に渡す）
+  pool done <ID> --commit <SHA>
+  pool list [--status <状態>]... [--kind <種類>] [--all]
+  pool show <ID>
+  pool search <語>... | pool search --file <パス>
+  どのサブコマンドも --name <名前> でリポジトリの名前を上書きできる`;
+
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+const usage = (msg) => die(msg ? `${msg}\n${USAGE}` : USAGE);
+
+// サブコマンドごとに受ける引数。値を取るもの、繰り返せるもの、値を取らないもの、位置引数の数。
+const SPECS = {
+  add: { value: ['kind', 'slug', 'title', 'pattern', 'work-kind', 'recurrence-of'], repeat: ['case', 'task', 'file'], positional: [0, 0] },
+  'add-case': { positional: [2, 2] },
+  todo: { positional: [1, 1] },
+  reject: { value: ['why', 'quote'], positional: [1, 1] },
+  done: { value: ['commit'], positional: [1, 1] },
+  list: { value: ['kind'], repeat: ['status'], bool: ['all'], positional: [0, 0] },
+  show: { positional: [1, 1] },
+  search: { repeat: ['file'], positional: [0, Infinity] },
+};
+
+function parseArgs(sub, args) {
+  const spec = SPECS[sub];
+  const value = [...(spec.value ?? []), 'name'];
+  const repeat = spec.repeat ?? [];
+  const bool = spec.bool ?? [];
+  const flags = {};
+  for (const k of repeat) flags[k] = [];
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) {
+      positional.push(a);
+      continue;
+    }
+    const key = a.slice(2);
+    if (bool.includes(key)) {
+      flags[key] = true;
+      continue;
+    }
+    if (!value.includes(key) && !repeat.includes(key)) usage(`${sub}: 知らない引数 ${a}`);
+    const v = args[++i];
+    if (v === undefined || v.startsWith('--')) usage(`${sub}: ${a} に値が無い`);
+    if (repeat.includes(key)) flags[key].push(v);
+    else if (key in flags) usage(`${sub}: ${a} が二度ある`);
+    else flags[key] = v;
+  }
+  const [min, max] = spec.positional;
+  if (positional.length < min || positional.length > max) usage(`${sub}: 位置引数の数が違う`);
+  return { flags, positional };
+}
+
+const here = dirname(fileURLToPath(import.meta.url));
+const cwd = process.cwd();
+
+// 却下は人間が決める。Claude Code はコマンドに CLAUDECODE を渡すので、これがあれば、却下を頼んだ人間の発言を --quote で求め、
+// 今の会話の最後の人間の発言と照らす（checkHumanQuote）。照らせた発言を一件に残す。エージェントが自分の判断で却下しないためである。
+// Claude Code の外の端末（CLAUDECODE が無い）では、人間が自分で実行しているので照らさない。
+function rejectedBy(quote) {
+  if (!process.env.CLAUDECODE) return squash(quote) ? `端末の人間 「${squash(quote)}」` : '端末の人間';
+  if (!squash(quote)) die('reject: Claude Code の中では、人間が会話で却下を頼んだ発言を --quote にそのまま切り出して渡す。人間が頼んでいなければ却下しない（Claude Code の外の端末からは --quote なしで実行できる）');
+  const session = envSessionId();
+  if (!session) die('reject-unverified: 会話のセッション ID が無いので、却下を頼んだ発言を照らせない。人間に Claude Code の外の端末から実行してもらう');
+  const r = checkHumanQuote(quote, { session });
+  if (r.rule === 'question') die(`reject-question: ${r.reason}。問いへの答えの無い返事は、却下の依頼ではない。問いに答えてから、却下の言葉をもう一度もらう`);
+  if (r.rule) die(`reject-unverified: ${r.reason}。最後の発言から切り出すか、却下の言葉をもう一度送ってもらう`);
+  return r.evidence;
+}
+
+const row = (it, prefix = []) => [...prefix, it.id, it.fields.status ?? '', it.fields.kind ?? '', it.fields.title ?? ''];
+// 端末に出すときは列幅を揃え、パイプやファイルに出すときはタブ区切りにする。タブ区切りを読む道具やテストがあるためである。
+function printRows(rows) {
+  const lines = process.stdout.isTTY ? alignRows(rows) : rows.map((r) => r.join('\t'));
+  for (const l of lines) console.log(l);
+}
+
+// 起票先は、直すファイルのあるリポジトリのプールにする（docs/design.md の「改善候補のプール」）。
+// --file の各パスが、今のリポジトリ（cwd の作業ツリー）にあるかを見る。これから作るファイルもあるので、親のディレクトリがあればあると見る。
+// ただし最上位の一段のパスは、親がどのリポジトリにもある最上位になり打ち間違いも通るので、ファイルが実際にあるときだけあると見る。
+// gori のプールに回すときは --name を断る。今のリポジトリの名前の上書きを、gori のプールの名前に使わないためである。
+// すべて今のリポジトリにあれば今のリポジトリ、どれも無くすべて gori のチェックアウトにあれば gori のプールに書く。
+// どちらにも無いパスがあるか、二つに分かれるなら、起票先を推測せず止まる。--file が無ければ今のリポジトリに書く。
+function targetDir(files, gori, nameFlag) {
+  if (files.length === 0) return cwd;
+  const bad = files.filter((f) => isAbsolute(f) || normalize(f).split(sep).includes('..'));
+  if (bad.length) die(`add: --file はリポジトリの最上位からの相対パスで渡す: ${bad.join('、')}`);
+  const top = runGit(cwd, ['rev-parse', '--show-toplevel']);
+  if (top === null) return cwd; // git のリポジトリでなければ、resolvePool が直し方を示して止まる。
+  const has = (root, f) => existsSync(join(root, f)) || (dirname(normalize(f)) !== '.' && existsSync(dirname(join(root, f))));
+  const here = files.filter((f) => has(top, f));
+  if (here.length === files.length) return cwd;
+  const elsewhere = files.filter((f) => !has(top, f));
+  const inGori = elsewhere.filter((f) => has(gori, f));
+  if (inGori.length === elsewhere.length && here.length === 0) {
+    if (nameFlag !== undefined) die(`add: --file のパスは gori のチェックアウトにあり、gori のプールに起票するので、--name ${nameFlag} は付けない`);
+    console.error(`add: --file のパスはこのリポジトリ（${top}）に無く、gori のチェックアウトにあるので、gori のプールに起票する`);
+    return gori;
+  }
+  if (inGori.length === elsewhere.length) die(`add: --file が、このリポジトリのパス（${here.join('、')}）と gori のパス（${inGori.join('、')}）に分かれる。直すリポジトリごとに分けて起票する`);
+  die(`add: --file のパスが、このリポジトリ（${top}）にも gori のチェックアウトにも無い: ${elsewhere.filter((f) => !inGori.includes(f)).join('、')}。直すファイルのあるリポジトリの中で実行する`);
+}
+
+function add({ flags }, gori) {
+  if (!KINDS.includes(flags.kind)) usage('add: --kind には learning か improvement か procedure を渡す');
+  if (!flags.slug || !SLUG.test(flags.slug)) usage('add: --slug には小文字英数字とハイフンの slug を渡す');
+  if (!flags.title || !flags.title.trim()) usage('add: --title を渡す');
+  const learning = flags.kind === 'learning';
+  const procedure = flags.kind === 'procedure';
+  if (procedure) {
+    if (flags.pattern !== undefined || flags.case.length || flags['recurrence-of'] !== undefined) die('add: procedure には --pattern、--case、--recurrence-of を付けない');
+    if (!flags['work-kind']) die('add: procedure には --work-kind が要る');
+    if (!SLUG.test(flags['work-kind'])) die('add: --work-kind は小文字英数字とハイフンの形にする');
+    if (flags.task.length === 0) die('add: procedure には --task が一つ以上要る');
+    const bad = flags.task.filter((t) => !TASK_REF.test(t));
+    if (bad.length) die(`add: --task は <リポジトリ>/<作業ID> の形にする: ${bad.join('、')}`);
+  } else if (flags['work-kind'] !== undefined || flags.task.length) {
+    die(`add: ${flags.kind} には --work-kind と --task を付けない`);
+  }
+  if (learning) {
+    if (!flags.pattern) die('add: learning には --pattern が要る');
+    if (!SLUG.test(flags.pattern)) die('add: --pattern は小文字英数字とハイフンの形にする');
+    if (flags.case.length === 0) die('add: learning には --case が一つ以上要る');
+  } else if (!procedure) {
+    if (flags.pattern !== undefined || flags.case.length) die('add: improvement には --pattern と --case を付けない');
+    if (flags['recurrence-of'] !== undefined) die('add: --recurrence-of は learning（同じ pattern の done の再発）にだけ付ける');
+  }
+  let body = readFileSync(0, 'utf8');
+  const missing = missingHeadings(body);
+  if (missing.length) die(`add: 本文に見出しが無い: ${missing.join('、')}`);
+  const secrets = secretFields({ '--title': flags.title, '本文': body });
+  if (secrets.length) die(`secret-like: ${secrets.join('、')} に秘密情報らしい文字列がある。伏せるか言い換えて書き直す（記録は作業の後も残る）`);
+
+  const pool = resolvePool(gori, targetDir(flags.file, gori, flags.name), flags.name, { write: true });
+  let recurrence = null;
+  if (learning) {
+    const same = loadItems(pool.poolDir).filter((it) => it.fields.kind === 'learning' && it.fields.pattern === flags.pattern);
+    const open = same.find((it) => it.fields.status !== 'done');
+    if (open) die(`add: pattern ${flags.pattern} の一件 ${open.id}（${open.fields.status}）が既にある。起票せず \`pool add-case ${open.id} <事例>\` で事例を足す`, 3);
+    if (same.length) {
+      const r = flags['recurrence-of'];
+      if (r === undefined) die(`add: pattern ${flags.pattern} は done の ${same.at(-1).id} で対策済み。再発として起票するなら --recurrence-of ${same.at(-1).id} を付ける`, 3);
+      if (!same.some((it) => it.id === r)) die(`add: --recurrence-of ${r} は pattern ${flags.pattern} の done の一件でない（候補: ${same.map((it) => it.id).join('、')}）`);
+      recurrence = r;
+    } else if (flags['recurrence-of'] !== undefined) {
+      die(`add: pattern ${flags.pattern} の done の一件が無いので --recurrence-of は付けない`);
+    }
+  }
+
+  if (procedure) {
+    // 手順書の候補は、同じ work-kind の一件があれば状態を問わず断る。毎回全件を読み直して起票するので、二重の起票をここで防ぐ（docs/design.md）。
+    const same = loadItems(pool.poolDir).find((it) => it.fields.kind === 'procedure' && it.fields['work-kind'] === flags['work-kind']);
+    if (same) die(`add: work-kind ${flags['work-kind']} の一件 ${same.id}（${same.fields.status}）が既にある。起票しない`, 3);
+  }
+
+  const now = new Date();
+  const id = `${idStamp(now)}-${flags.slug}`;
+  const file = itemPath(pool.poolDir, id);
+  if (existsSync(file)) die(`add: 同じ ID ${id} の一件が既にある`);
+  const time = nowIso(now);
+  const fields = { id, title: flags.title, kind: flags.kind, status: 'proposed', created: time, updated: time };
+  if (learning) Object.assign(fields, { pattern: flags.pattern, cases: [...new Set(flags.case)] });
+  if (procedure) Object.assign(fields, { 'work-kind': flags['work-kind'], tasks: [...new Set(flags.task)] });
+  if (flags.file.length) fields.files = [...new Set(flags.file)];
+  if (recurrence) {
+    fields.recurrence_of = recurrence;
+    body = prependToCurrent(body, `${recurrence} の対策の後に再発した。`);
+  }
+  const text = serializeItem(fields, body);
+  parseItem(text, file);
+  mkdirSync(pool.poolDir, { recursive: true });
+  // 同じ ID の並行の起票を上書きしないよう、無いときだけ作る。
+  try {
+    writeFileSync(file, text, { flag: 'wx' });
+  } catch {
+    die(`add: 同じ ID ${id} の一件が既にある`);
+  }
+  console.log(id);
+}
+
+function update(item, changes) {
+  const fields = { ...item.fields, ...changes, updated: nowIso() };
+  writeItem(item.file, fields, item.body);
+}
+
+function addCase({ flags, positional: [id, caseId] }, gori) {
+  const pool = resolvePool(gori, cwd, flags.name, { write: true });
+  const item = readItem(pool.poolDir, id);
+  if (item.fields.kind !== 'learning') die(`add-case: ${id} は learning でない（${item.fields.kind}）`);
+  const cases = listField(item.fields, 'cases');
+  if (cases.includes(caseId)) {
+    console.log(`${id}: ${caseId} は既にある`);
+    return;
+  }
+  update(item, { cases: [...cases, caseId] });
+  console.log(`${id}: ${caseId} を足した`);
+}
+
+function transition(sub, { flags, positional: [id] }, gori, from, changes) {
+  const pool = resolvePool(gori, cwd, flags.name, { write: true });
+  const item = readItem(pool.poolDir, id);
+  if (!from.includes(item.fields.status)) die(`${sub}: ${id} は ${item.fields.status}。${sub} にできるのは ${from.join(' か ')} からだけ`);
+  const extra = typeof changes === 'function' ? changes(pool) : changes;
+  update(item, { status: sub === 'reject' ? 'rejected' : sub, ...extra });
+  console.log(`${id}: ${item.fields.status} から ${sub === 'reject' ? 'rejected' : sub} にした`);
+}
+
+// todo は受け入れ条件の承認として扱い、done は main に入ったことの記録なので、無人の作業にはどちらもさせない（docs/design.md の「自律起動」）。
+function todo(args, gori) {
+  refuseIfAuto('pool todo');
+  transition('todo', args, gori, ['proposed'], {});
+}
+
+// 無人の作業には、発言を添えても却下させない。無人の作業の「人間の発言」は、作業を起動した道具の依頼文だからである。
+function reject(args, gori) {
+  refuseIfAuto('pool reject');
+  const why = args.flags.why?.trim();
+  if (!why) usage('reject: --why に理由を渡す');
+  const by = rejectedBy(args.flags.quote);
+  transition('reject', args, gori, ['proposed', 'todo'], { reason: why, rejected_by: by });
+}
+
+function done(args, gori) {
+  refuseIfAuto('pool done');
+  if (!args.flags.commit) usage('done: --commit に SHA を渡す');
+  transition('done', args, gori, ['todo'], (pool) => ({ commit: commitOnMain(pool.main, args.flags.commit) }));
+}
+
+function list({ flags }, gori) {
+  for (const s of flags.status) if (!STATUSES.includes(s)) usage(`list: --status は ${STATUSES.join('、')} のどれか`);
+  if (flags.kind !== undefined && !KINDS.includes(flags.kind)) usage(`list: --kind は ${KINDS.join('、')} のどれか`);
+  const statuses = flags.status.length ? flags.status : ['proposed', 'todo'];
+  const pick = (it) => statuses.includes(it.fields.status) && (flags.kind === undefined || it.fields.kind === flags.kind);
+  if (flags.all) {
+    if (flags.name !== undefined) usage('list: --all と --name は一緒に使わない');
+    const root = reposDir(gori);
+    const names = existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort() : [];
+    printRows(names.flatMap((name) => loadItems(join(root, name, 'pool')).filter(pick).map((it) => row(it, [name]))));
+    return;
+  }
+  const pool = resolvePool(gori, cwd, flags.name);
+  printRows(loadItems(pool.poolDir).filter(pick).map((it) => row(it)));
+}
+
+function show({ flags, positional: [id] }, gori) {
+  const pool = resolvePool(gori, cwd, flags.name);
+  process.stdout.write(readItem(pool.poolDir, id).text);
+}
+
+function search({ flags, positional: words }, gori) {
+  if (words.length === 0 && flags.file.length === 0) usage('search: 語か --file を渡す');
+  const pool = resolvePool(gori, cwd, flags.name);
+  const lower = words.map((w) => w.toLowerCase());
+  const hits = [];
+  for (const it of loadItems(pool.poolDir)) {
+    const hay = `${it.fields.title ?? ''}\n${it.body}`.toLowerCase();
+    if (!lower.every((w) => hay.includes(w))) continue;
+    const files = listField(it.fields, 'files');
+    if (!flags.file.every((f) => files.includes(f))) continue;
+    hits.push(row(it));
+  }
+  printRows(hits);
+}
+
+const cmds = { add, 'add-case': addCase, todo, reject, done, list, show, search };
+const [sub, ...rest] = process.argv.slice(2);
+if (!cmds[sub]) usage(sub === undefined ? '' : `知らないサブコマンド ${sub}`);
+const args = parseArgs(sub, rest);
+try {
+  const gori = goriCheckout(join(here, '..', '..'));
+  cmds[sub](args, gori);
+} catch (e) {
+  if (e instanceof PoolError) die(e.message, e.code);
+  throw e;
+}

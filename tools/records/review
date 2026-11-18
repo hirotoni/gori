@@ -1,0 +1,622 @@
+#!/usr/bin/env node
+import { parseArgs } from '../lib/args.mjs';
+import { spawn, spawnSync } from 'node:child_process';
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { RESULTS, TASK_ID, TASK_ID_FORM, acceptState, auditPath, git, gitCommonDir, goriDir, parseAudit, recordsGori, resolveRepoDir, storeVerdict, workBase, workerSessions } from '../lib/audit.mjs';
+import { autoLimits, isAuto } from '../lib/auto.mjs';
+import { modelFor } from '../lib/models.mjs';
+import { reviewWeight } from '../lib/weight.mjs';
+import { KEEP_MARK, staleNames } from '../lib/stale-names.mjs';
+import { PoolError, acceptanceItems, goriCheckout, readItem, resolvePool } from '../lib/pool.mjs';
+import { assistantText, choiceAnswers, humanText, projectsDir, readLines, sessionFiles, squash } from '../lib/transcripts.mjs';
+
+const goriRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+const REVIEW_USAGE = '使い方: review --task <作業ID> [--sha <commit>] [--base <commit>] [--e2e <相対パス>]... [--model <名前>] [--repo <dir>] [--dry-run]';
+const { flags, positional: extra } = parseArgs(process.argv.slice(2), { value: ['task', 'sha', 'base', 'model', 'repo'], repeat: ['e2e'], bool: ['dry-run'] }, REVIEW_USAGE);
+flags.dryRun = flags['dry-run'] === true;
+if (extra.length) {
+  console.error(`引数 ${extra.join(' ')} を読めない（フラグの値なら、その前のフラグの綴りを確かめる）\n${REVIEW_USAGE}`);
+  process.exit(2);
+}
+
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+
+if (!flags.task || !TASK_ID.test(flags.task)) die(`--task には ${TASK_ID_FORM} の作業 ID を渡す`);
+const task = flags.task;
+const repo = resolveRepoDir(flags.repo, task);
+const sha = git(repo, ['rev-parse', '--verify', `${flags.sha ?? 'HEAD'}^{commit}`]);
+if (!sha) die(`${repo}: ${flags.sha ?? 'HEAD'} を commit に解決できない`);
+let audit;
+try {
+  audit = auditPath(repo, task);
+} catch (e) {
+  die(e.message, 2);
+}
+// 作業リポジトリの git の共通ディレクトリ。作業ツリーが課題の worktree なら、作業ツリーとは別の場所になる。レビュアーには書かせない。
+const workCommon = gitCommonDir(repo);
+if (!workCommon) die(`${repo}: git の共通ディレクトリを求められない`);
+// 記録を置く gori のチェックアウト（記録は、その git の共通ディレクトリの下の gori/repos/<名前>/ にある）。レビュアーには書かせない。
+let gori;
+try {
+  gori = recordsGori();
+} catch (e) {
+  die(e.message, 2);
+}
+const goriCommon = gitCommonDir(gori);
+if (!goriCommon) die(`${gori}: git の共通ディレクトリを求められない`);
+if (!existsSync(audit)) die(`${audit}: 判断の記録が無い。受け入れ基準を決められないのでレビューを依頼できない`);
+
+// モデルはレビューの重さを決めた後に選ぶ（下の reviewWeight）。--model があればそれを使う。
+let model = flags.model;
+
+const rows = parseAudit(readFileSync(audit, 'utf8')).slice(1).map((r) => r.row);
+const start = rows.find((r) => r.type === 'start');
+if (!start) die(`${audit}: start 行が無い`);
+const steps = rows.filter((r) => r.type === 'step');
+// 行番号は記録のファイルの物理行（ヘッダが 1 行目）。fix の「行 N を訂正」「行 N を取り下げ」と同じ数え方である。
+const numbered = parseAudit(readFileSync(audit, 'utf8')).slice(1);
+const { accepts, fixesOf, withdrawals, corrections, active } = acceptState(numbered);
+if (accepts.length === 0) die(`${audit}: accept 行が無い。受け入れ条件を log add --type accept で記録してからレビューを依頼する`);
+
+// プールの一件から始めた作業は、受け入れ条件を写さず、accept 行に pool:<ID> とだけ書く（skills/decision-log）。
+// レビューのたびに作業中のリポジトリのプールの一件を読み、その時点の「## 受け入れ条件」の各行を渡す。受け入れ条件の正本をプールの一か所にするためである。
+// プールは gori のチェックアウトの git の共通ディレクトリの下にあり、本体のチェックアウトの名前で引く（tools/lib/pool.mjs）。課題の worktree から依頼しても同じ一件を読む。
+const POOL_REF = /^pool:(\S+)$/;
+function poolCriteria(id) {
+  let item;
+  try {
+    const pool = resolvePool(goriCheckout(goriRoot), repo);
+    item = readItem(pool.poolDir, id);
+  } catch (e) {
+    if (e instanceof PoolError) die(`accept 行 pool:${id} の受け入れ条件を読めない: ${e.message}`);
+    throw e;
+  }
+  const items = acceptanceItems(item.body);
+  if (items.length === 0) die(`${item.file}: 受け入れ条件（「## 受け入れ条件」の下の - で始まる行）が無い`);
+  return items;
+}
+const acceptText = (r) => {
+  const ref = POOL_REF.exec(r.row.what.trim());
+  if (!ref) return `- 行 ${r.line}: ${r.row.what}`;
+  return poolCriteria(ref[1]).map((c, i) => `- 行 ${r.line}（${ref[1]} の受け入れ条件 ${i + 1}）: ${c}`).join('\n');
+};
+// fix 行は、accept 行を訂正するか取り下げる（skills/decision-log）。取り下げた accept 行とその訂正は基準に入れず、取り下げた条件として理由とともに知らせる。
+// 途中で方針が変わって要らなくなった条件で、レビュアーが不合格にしないためである。
+if (active.length === 0) die(`${audit}: 受け入れ条件がすべて取り下げられている。今の受け入れ条件を log add --type accept で書き、承認を得てからレビューを依頼する`);
+
+// 受け入れ条件は人間の承認を得てからレビューに出す（config/routing）。最後の受け入れ条件の行か、受け入れ条件を訂正するか取り下げる行より後に、
+// 承認の行（log add --type approval。会話の中からは、引用が最後の人間の入力に含まれるときだけ書ける）が無ければ、レビュアーを起動しない。
+// 受け入れ条件を直すか取り下げた後も承認をもらい直させるのは、直した条件を人間が見ていないままレビューに出さないためである。
+const lastAcceptLine = Math.max(...accepts.map((r) => r.line), ...fixesOf('訂正').map((r) => r.line), ...withdrawals.map((r) => r.line));
+// 無人の作業（GORI_AUTO）は、人間が一件を todo に上げたことを受け入れ条件の承認として扱う（docs/design.md の「自律起動」）。
+// 受け入れ条件の行がどれも pool:<ID> で、訂正も取り下げも無く、その一件が今も todo のときに限り、承認の行が無くてもレビュアーを起動する。
+// 担当が条件を足すか直した作業は、人間が見ていない条件を含むので、無人でも今までどおり止める。
+function todoApproved() {
+  if (!isAuto()) return null;
+  if (fixesOf('訂正').length || withdrawals.length) return null;
+  const ids = accepts.map((r) => POOL_REF.exec(r.row.what.trim())?.[1]);
+  if (ids.some((id) => !id)) return null;
+  for (const id of ids) {
+    try {
+      const pool = resolvePool(goriCheckout(goriRoot), repo);
+      if (readItem(pool.poolDir, id).fields.status !== 'todo') return null;
+    } catch (e) {
+      if (e instanceof PoolError) return null;
+      throw e;
+    }
+  }
+  return ids;
+}
+const autoApproved = todoApproved();
+if (!autoApproved && !numbered.some((r) => r.row.type === 'approval' && r.line > lastAcceptLine)) {
+  die(`${audit}: 行 ${lastAcceptLine}（最後の受け入れ条件か、その訂正か取り下げ）より後に承認の行が無い。受け入れ条件を人間に示して承認を得てから、${join(goriRoot, 'tools', 'records', 'log')} add --task ${task} --type approval --what "<承認された案>" --quote "<承認の言葉>" を書いて依頼し直す（案には番号を振って示し、人間の返事から承認の言葉を切り出して渡す。複数の問いに答えた返事なら全文を渡す）`);
+}
+
+// レビュアーは、承認の行が受け入れ条件の案そのものを承認しているかを確かめる（agents/reviewer）。
+// そのため、承認の引用に、その発言の直前に担当が示したメッセージ（問いと案）を添えて渡す。
+// 直前のメッセージは、一つ前の人間の発言から後の担当の発言をつないだものである。
+// 選択式の質問（AskUserQuestion）への回答で書いた承認では、回答も人間の入力として区切りに数える。
+// 文章の発言の承認では回答で区切らない。回答の前に示した案の本文を、レビュアーに渡し続けるためである。
+// 作業の通知（<task-notification>）は人間の発言に数えず、またいでつなぐ。
+// 長いメッセージでも問いは末尾に来やすいので、末尾の BEFORE_MAX 文字を残す。
+const BEFORE_MAX = 4000;
+const NOTIFICATION = /^<task-notification>/;
+function clip(t) {
+  const s = squash(t);
+  return [...s].length > BEFORE_MAX ? `…${[...s].slice(-BEFORE_MAX).join('')}` : s;
+}
+// 承認の行が指す人間の入力を探し、その直前のメッセージを返す。選択式の回答なら、各問いの文と選択肢と選んだ答えも返す。
+function shownBefore(session, message, byChoice) {
+  const file = session && session !== '-' ? sessionFiles(projectsDir()).get(session) : null;
+  if (!file) return null;
+  let said = [];
+  for (const o of readLines(file)) {
+    const a = assistantText(o);
+    if (a !== null) said.push(a);
+    const h = humanText(o);
+    const answers = byChoice ? choiceAnswers(o) : null;
+    if ((h === null || NOTIFICATION.test(h)) && !answers) continue;
+    if (o.uuid === message) {
+      const before = clip(said.join('\n'));
+      if (!answers) return { before };
+      const asked = o.toolUseResult?.questions ?? [];
+      const choices = answers.map(({ question, answer }) => {
+        const labels = (asked.find((q) => q.question === question)?.options ?? []).map((x) => x.label).filter(Boolean);
+        return `問い「${squash(question)}」${labels.length ? ` 選択肢: ${labels.map((l) => `「${squash(l)}」`).join('、')}` : ''} 選んだ答え「${squash(answer)}」`;
+      });
+      return { before, choices };
+    }
+    said = [];
+  }
+  return null;
+}
+const approvals = numbered.filter((r) => r.row.type === 'approval' && r.line > lastAcceptLine);
+const approvalSection = autoApproved && approvals.length === 0 ? `無人の作業である。承認の行は無い。人間がプールの一件（${autoApproved.join('、')}）を todo に上げたことを、その受け入れ条件の承認として扱う（docs/design.md の「自律起動」）。一件が todo であることと、受け入れ条件の行がその一件を指す行だけであることは、道具が確かめた。承認の行が無いことを理由に不合格にしない。` : approvals.map((r) => {
+  const head = `- 行 ${r.line}: ${r.row.what}（${r.row.evidence}）`;
+  const m = /^(発言|回答) (\S+) /.exec(r.row.evidence);
+  if (!m) return `${head}\n  端末の人間が書いた承認で、直前のメッセージは無い。`;
+  const found = shownBefore(r.row.session, m[2], m[1] === '回答');
+  if (!found || (m[1] === '発言' && !found.before)) return `${head}\n  会話の記録を引けないので、直前のメッセージは確かめられない。`;
+  const lines = [head];
+  if (m[1] === '回答') {
+    lines.push('  選択式の質問への回答で書いた承認である。問いの文は作業者が書いたもので、人間が選んだのは答えである。');
+    if (found.choices) for (const c of found.choices) lines.push(`  - ${c}`);
+  }
+  lines.push(found.before ? `  この${m[1]}の直前に作業者が示したメッセージ:\n  > ${found.before}` : `  この${m[1]}の直前に、作業者のメッセージは無い。`);
+  return lines.join('\n');
+}).join('\n');
+
+// 受入基準を読めなければ、レビュアーを起動する前に止まる。
+const acceptSection = active.map(acceptText).join('\n');
+const withdrawnSection = withdrawals.length ? `
+## 取り下げた条件（基準ではない）
+作業の途中で取り下げた受け入れ条件で、合否の基準にしない。
+${withdrawals.map((w) => `${acceptText(accepts.find((a) => a.line === w.target))}\n  取り下げ（行 ${w.line}）: ${w.row.what}`).join('\n')}
+作業の目的と受け入れ基準が食い違うときは、受け入れ基準を優先する。
+` : '';
+
+// レビューした commit がそのまま main に fast-forward で入るよう、main の先端を含まない commit はレビューしない。
+// 比べるのはローカルの main、無ければ master である。どちらも無ければ確かめない。
+const mainName = ['main', 'master'].find((b) => git(repo, ['rev-parse', '--verify', '-q', `refs/heads/${b}^{commit}`]));
+if (mainName) {
+  const tip = git(repo, ['rev-parse', '--verify', `refs/heads/${mainName}^{commit}`]);
+  if (spawnSync('git', ['-C', repo, 'merge-base', '--is-ancestor', tip, sha]).status !== 0) {
+    die(`commit ${sha} は ${mainName} の先端 ${tip} を含まない。レビューしても取り込むときに載せ直しが要り、レビューをやり直すことになるので、レビュアーを起動しない。${join(goriRoot, 'tools', 'repo', 'sync-main')} --task ${task} で ${mainName} の最新を取り込み、検証をやり直してから review --task ${task} --base ${mainName} で依頼し直す。レビューを受けた commit を手で書き換えない（criteria/done）`);
+  }
+}
+
+// verdict record は、HEAD をレビューした結果を、作業ツリーが汚れていると dirty-tree で断る（tools/records/verdict）。
+// レビュアーはその作業ツリーを直せないので、確かめ終えた後に断られて一回分が無駄になる。起動する前に同じ条件で止める。
+if (sha === git(repo, ['rev-parse', 'HEAD'])) {
+  const dirty = (git(repo, ['status', '--porcelain']) ?? '').split('\n').filter(Boolean);
+  if (dirty.length) {
+    const DIRTY_SHOWN = 10;
+    die(`${repo}: 作業ツリーに未コミットの変更か未追跡のファイルがある（${dirty.length} 件）。レビュー結果を記録できないので、レビュアーを起動しない。commit するか片付けてから、review --task ${task} で依頼し直す:\n${dirty.slice(0, DIRTY_SHOWN).map((l) => `  ${l}`).join('\n')}${dirty.length > DIRTY_SHOWN ? `\n  ほか ${dirty.length - DIRTY_SHOWN} 件` : ''}`);
+  }
+}
+
+// 範囲の起点: --base の指定、無ければ workBase（start 行の base=、start より前の最後の commit、親、空の木の順）。
+function decideBase() {
+  if (flags.base) {
+    const b = git(repo, ['rev-parse', '--verify', `${flags.base}^{commit}`]);
+    if (!b) die(`--base ${flags.base} を commit に解決できない`);
+    return { base: b, how: '--base の指定' };
+  }
+  return workBase(repo, start, sha);
+}
+const { base, how } = decideBase();
+
+// 範囲で消したか名前を変えたファイルの名前が残っていれば、レビュアーを起動しない（tools/lib/stale-names.mjs）。
+// 旧い名前の消し残しは、レビューで不合格になり往復が一回増えるので、起動する前に見つける。
+const stale = staleNames(repo, base, sha);
+if (stale.length) {
+  const SHOWN = 20;
+  die(`commit ${sha} に、範囲（起点 ${base}）で消したか名前を変えたファイルの名前が ${stale.length} か所残っている。今の形に直して commit してから、review --task ${task} で依頼し直す。消した経緯として残す行は、行の中に印 ${KEEP_MARK} を書けば数えない。レビュアーを起動しない:\n${stale.slice(0, SHOWN).map((h) => `  ${h.file}:${h.line}: ${h.names.map((n) => `${n.name}（${n.from}）`).join('、')}: ${h.text.slice(0, 160)}`).join('\n')}${stale.length > SHOWN ? `\n  ほか ${stale.length - SHOWN} か所` : ''}`);
+}
+
+// --e2e のスクリプトは、レビューする commit にあるものだけを受け付ける。無ければレビュアーを起動しない。
+const e2eScripts = flags.e2e ?? [];
+// スクリプトの一行目の shebang の解釈器（bash、sh、zsh）と、その後ろの引数（#!/bin/bash -e の -e、#!/usr/bin/env -S zsh -f の -f）。
+// shebang が無ければ bash。知らない解釈器なら null。env の後ろの - で始まる語（-S など）は env の引数なので、解釈器の名前の前では読み飛ばす。
+const E2E_SHELLS = ['bash', 'sh', 'zsh'];
+function e2eInterpreter(firstLine) {
+  if (!firstLine.startsWith('#!')) return { cmd: 'bash', args: [] };
+  const words = firstLine.slice(2).trim().split(/\s+/).filter(Boolean);
+  let rest = words.slice(1);
+  let name = basename(words[0] ?? '');
+  if (name === 'env') {
+    const i = rest.findIndex((w) => !w.startsWith('-'));
+    name = i < 0 ? '' : basename(rest[i]);
+    rest = i < 0 ? [] : rest.slice(i + 1);
+  }
+  return E2E_SHELLS.includes(name) ? { cmd: name, args: rest } : null;
+}
+const e2eShell = new Map();
+for (const sc of e2eScripts) {
+  if (!sc || sc.startsWith('/') || sc.split('/').includes('..')) die(`--e2e ${sc}: リポジトリからの相対パスで渡す`);
+  const ty = spawnSync('git', ['-C', repo, 'cat-file', '-t', `${sha}:${sc}`], { encoding: 'utf8' });
+  if (ty.status !== 0 || ty.stdout.trim() !== 'blob') die(`--e2e ${sc}: commit ${sha} にこのスクリプトが無い。レビュアーを起動しない`);
+  const firstLine = (spawnSync('git', ['-C', repo, 'show', `${sha}:${sc}`], { encoding: 'utf8' }).stdout ?? '').split('\n')[0].replace(/\r$/, '');
+  const shell = e2eInterpreter(firstLine);
+  if (!shell) die(`--e2e ${sc}: shebang「${firstLine}」の解釈器は知らない（bash、sh、zsh だけ）。レビュアーを起動しない`);
+  e2eShell.set(sc, shell);
+}
+// レビューの重さ。範囲の差分のファイルから道具が決め、軽ければ reviewer-light のモデルで、確かめる範囲を絞って依頼する。
+const changed = (git(repo, ['diff', '--name-only', '--no-renames', base, sha]) ?? '').split('\n').filter(Boolean);
+const { weight, reason: weightReason } = reviewWeight(changed, { e2e: e2eScripts.length > 0 });
+// 担当の自己点検の行（log add --type check）がそろっていなければ、レビュアーを起動しない。
+// 点検せずに出して不合格になる往復を防ぐためである。数えるのは、レビューする commit の SHA を result に持つ行だけで、点検の後に commit したら点検し直す。
+// 要る指し: 有効な受け入れ基準のそれぞれ（accept 行は「行 N」、pool:<ID> の行は条件 k ごとに「行 N#k」）、最後の承認の行（「承認」。無人の承認では要らない）、範囲の差分が .md を変えるときの「文書」。
+{
+  const needed = [];
+  for (const a of active) {
+    const ref = POOL_REF.exec(a.row.what.trim());
+    if (!ref) needed.push(`行 ${a.line}`);
+    else poolCriteria(ref[1]).forEach((_, i) => needed.push(`行 ${a.line}#${i + 1}`));
+  }
+  if (!autoApproved) needed.push('承認');
+  if (changed.some((f) => /\.md$/i.test(f))) needed.push('文書');
+  const done = new Set(numbered.filter((r) => r.row.type === 'check' && r.row.result === sha && r.row.evidence && r.row.evidence !== '-').map((r) => r.row.what));
+  const missing = needed.filter((c) => !done.has(c));
+  if (missing.length) {
+    const logTool = join(goriRoot, 'tools', 'records', 'log');
+    die(`${audit}: commit ${sha} の自己点検の行（check 行）が欠けている。レビュアーを起動しない。欠けた指し:\n${missing.map((c) => `  - ${c}`).join('\n')}\n実物で点検してから、欠けた指しごとに書く（点検の後に commit したら、点検し直す）:\n  ${logTool} add --task ${task} --type check --criterion '<指し>' --evidence '<コマンドと出力の要点>'\n指し: 「行 N」「行 N#k」は受け入れ基準（N は accept 行、k は pool:<ID> の条件の番号）、「承認」は最後の承認の行が案そのものを承認していること、「文書」は差分が .md に書いた値、件数、振る舞いを実物と照らしたこと`);
+  }
+}
+if (!model) {
+  try {
+    model = modelFor(goriRoot, weight === 'light' ? 'reviewer-light' : 'reviewer');
+  } catch (e) {
+    die(e.message);
+  }
+}
+const e2eName = (sc) => sc.replace(/\//g, '__');
+const E2E_TIMEOUT_SEC = Number(process.env.GORI_E2E_TIMEOUT_SEC || 1800);
+
+// 同じ作業のいちばん新しいレビュー結果が不合格か確認できずなら、その指摘を依頼文に渡す。直したか、足りなかった材料が今回あるかを先に確かめさせ、同じ不足で回数を重ねないためである。
+// 渡すのはレビュアー（か端末の人間）が記録したレビュー結果で、作業者の主張ではない。どの commit のものでも読む（載せ直しや修正で commit は変わる）。
+// 新しさはファイル名の先頭の時刻（verdictFileName）で決める。読めないファイルは飛ばす。合否の決め方は verdictState のままで、ここは依頼文の材料にするだけである。
+function taskVerdicts() {
+  let dir;
+  try {
+    dir = join(goriDir(repo), 'verdicts');
+  } catch {
+    return [];
+  }
+  if (!existsSync(dir)) return [];
+  const all = [];
+  for (const s of readdirSync(dir)) {
+    let names = [];
+    try {
+      names = readdirSync(join(dir, s)).filter((n) => n.endsWith('.json'));
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      let v;
+      try {
+        v = JSON.parse(readFileSync(join(dir, s, n), 'utf8'));
+      } catch {
+        continue;
+      }
+      if (v?.task === task) all.push({ name: n, v });
+    }
+  }
+  return all.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0)).map((x) => x.v);
+}
+const history = taskVerdicts();
+const last = history.at(-1);
+const prior = (last?.result === 'fail' || last?.result === 'unverified') && Array.isArray(last.findings) && last.findings.length ? last : null;
+
+// 確認できずが二回続いたら、三回目を起動しない。材料を足しても確かめられない基準は、人間が自分で確かめるか、受け入れ条件を見直すかを決める（docs/design.md）。
+const UNVERIFIED_LIMIT = 2;
+if (history.length >= UNVERIFIED_LIMIT && history.slice(-UNVERIFIED_LIMIT).every((v) => v.result === 'unverified')) {
+  console.log(`確認できず: この作業のレビューは ${UNVERIFIED_LIMIT} 回続けて確認できずだった。レビュアーを起動しない。止まって人間に報告し、確かめられなかった基準を人間が自分で確かめるか、受け入れ条件を見直すかを決めてもらう: ${last.findings.map((f) => String(f).replace(/\s*\n\s*/g, ' ')).join(' / ')}`);
+  process.exit(4);
+}
+const oneLine = (t) => String(t ?? '').replace(/\s*\n\s*/g, ' ').trim();
+const priorSection = !prior ? '' : prior.result === 'fail' ? `
+## 前回のレビュー結果（不合格）
+この作業の前回のレビュー（commit ${oneLine(prior.sha)}、${oneLine(prior.time)}、レビュアー ${oneLine(prior.judge)}）は不合格で、次の指摘があった。作業者の主張ではなく、レビュー結果の記録である。
+${prior.findings.map((f) => `- ${oneLine(f)}`).join('\n')}
+まず、指摘のそれぞれが直ったかを確かめる。${/^[0-9a-f]{40}$/.test(prior.sha ?? '') ? `前回のレビューからの変更は \`git diff ${prior.sha}..${sha}\` で読める（同じ commit なら差分は無い）。` : ''}
+そのうえで、受け入れ基準のすべてを、前回の指摘に限らず確かめる。
+` : `
+## 前回のレビュー結果（確認できず）
+この作業の前回のレビュー（commit ${oneLine(prior.sha)}、${oneLine(prior.time)}、レビュアー ${oneLine(prior.judge)}）は、確かめる手段の無い基準があるとして確認できずだった。作業者の主張ではなく、レビュー結果の記録である。
+${prior.findings.map((f) => `- ${oneLine(f)}`).join('\n')}
+まず、そこで足りなかった材料が今回あるかを確かめ、あればその基準を確かめる。${/^[0-9a-f]{40}$/.test(prior.sha ?? '') ? `前回のレビューからの変更は \`git diff ${prior.sha}..${sha}\` で読める（同じ commit なら差分は無い）。` : ''}
+そのうえで、受け入れ基準のすべてを、前回の指摘に限らず確かめる。
+`;
+
+const verdictTool = join(goriRoot, 'tools', 'records', 'verdict');
+const makePrompt = (e2eSection) => `あなたはレビュアーである。次の依頼を、この文章だけを頼りに実行すること。
+
+## 目的
+作業 ${task} の commit ${sha} の合否をレビューする。
+
+## 範囲
+\`git diff ${base}..${sha}\` の変更と、その commit の時点の作業ツリー（現在のディレクトリ）が対象である。起点 ${base} は ${how}である。
+
+## 受け入れ基準
+作業者が記録した受け入れ条件（行番号は判断の記録の行）:
+${acceptSection}
+${corrections.length ? `受け入れ条件への訂正（対応する条件より優先する）:\n${corrections.map((r) => `- 行 ${r.line}: ${r.row.what}`).join('\n')}\n` : ''}これらを満たしていることを、条件ごとに実物で確かめる。
+
+## 人間の承認
+最後の受け入れ条件より後に記録された承認:
+${approvalSection}
+${autoApproved && approvals.length === 0 ? '' : '返事が上の受け入れ基準の案を承認しているかと、直前のメッセージで尋ねた問いのうち案や受け入れ基準を左右する問いに答えがあるかを確かめる。案に関わらない問いに答えが無いことでは不合格にしない（agents/reviewer）。\n'}${withdrawnSection}
+## 作業の目的と手順
+作業の目的: ${start.what}
+${steps.length ? `作業の手順書の手順:\n${steps.map((s) => `${s.step}. ${s.what}`).join('\n')}\n` : ''}${priorSection}
+## 検証方法
+${weight === 'light' ? `この commit は、振る舞いに効かない文書だけを変えた軽い変更である（${weightReason}）。
+テストを全部は走らせない。差分が書いた事実（設定の値、件数、振る舞い、パスや名前）を、その設定や実装を読むか実物を数えて照らし、受け入れ基準を確かめる。
+作業者の報告や commit メッセージの主張は信じず、自分で確かめる。
+` : `実物を動かして確かめる。テストがあれば走らせ、出力を読む。
+作業者の報告や commit メッセージの主張は信じず、自分で再現する。
+読むだけで済ませず、変更が目的どおりに振る舞うことを、実際のコマンドの出力で示す。
+`}${e2eSection}
+## 禁止事項
+ファイルを編集しない。commit しない。push しない。
+この作業ツリーは使い捨てだが、元のリポジトリには書き込まない（書き込めないようになっている）。レビュー結果は \`verdict record\` が受け取り口に書き、review が確かめてから元のリポジトリに取り込む。
+
+## 報告の形式
+最後に必ず次のコマンドを一度だけ実行して、レビュー結果を記録する。
+
+\`\`\`
+${verdictTool} record --task ${task} --sha ${sha} --model ${model} --result pass --evidence "<実行したコマンドと、その出力の要点>" [--suggest "<直すことを勧める指摘>"]
+${verdictTool} record --task ${task} --sha ${sha} --model ${model} --result fail --finding "<満たしていない基準と、その実物の出力>"
+${verdictTool} record --task ${task} --sha ${sha} --model ${model} --result unverified --finding "<確かめられなかった基準と、何があれば確かめられるか>" --evidence "<試したコマンドとその出力、確かめられた基準の証拠>"
+\`\`\`
+
+pass には evidence を一つ以上、fail には finding を一件以上、unverified には finding と evidence をそれぞれ一つ以上付ける。それぞれ \`--evidence\`、\`--finding\`、\`--suggest\` は複数回書ける。
+不合格にするのは、受け入れ基準を一つでも満たさないとき、変更が既存の振る舞い（テスト、ほかの道具、文書が拠り所にする名前）を壊すとき、人間の承認が無いとき、差分が文書に書いた値、件数、振る舞いが実物と食い違うときである（agents/reviewer）。
+それ以外の、受け入れ基準の外の気づきや改善の提案では不合格にせず、pass に \`--suggest\` で添える。pass には \`--finding\` を付けない。
+確かめきれない基準が一つでもあれば、pass にしない。
+満たしていない基準が一つでもあれば fail にする。満たしていない基準が無く、確かめる手段の無い基準が残るときだけ unverified にする。手段が無いと決める前に、読む、動かす、サンドボックスの中でできる別の確かめ方を試す。
+記録したら、レビュー結果とその理由を数行で答える。
+`;
+
+// review がサンドボックスの外で実行した E2E の節。レビュアーのサンドボックスの中では claude を起動する E2E を走らせられないので、道具が代わりに走らせた結果を渡す。
+function e2eSectionOf(results) {
+  if (results.length === 0) return '';
+  const items = results.map((x) => `- スクリプト: ${x.script}
+  - 終了コード: ${x.code === null ? 'なし' : x.code}${x.timedOut ? `（時間の上限 ${E2E_TIMEOUT_SEC} 秒を超えたため止めた）` : ''}${x.pending ? '（--dry-run のため未実行）' : ''}
+  - 所要時間: ${x.pending ? '—' : `${x.seconds.toFixed(1)} 秒`}
+  - 全出力（標準出力と標準エラー）のファイル: ${x.logPath}
+  - この commit でのスクリプトの差分: \`git diff ${base}..${sha} -- ${x.script}\``).join('\n');
+  return `
+## review がサンドボックスの外で実行した E2E
+次の E2E は、レビュアーの中では走らせられない（API への通信が拒まれる）ので、review がレビューする commit ${sha} の別の一時 worktree で、サンドボックスの外で、スクリプトの shebang の解釈器（無ければ bash）で \`<解釈器> <スクリプト>\` として走らせた。作業者の自己申告ではなく、道具の実行結果である。
+${items}
+これを次のとおり扱う。
+- 全出力のファイルを Read で読み、受け入れ基準に関わる検査項目が実際に実行されて通っているかを、出力から自分で判断する。終了コードが 0 でも、出力を読まずに通ったとはしない。時間の上限で止まった、または終了コードが 0 以外なら、その事実を踏まえてレビューする。
+- スクリプトはこの commit で作業者が書き換えられる。差分が空でなければ、上の \`git diff\` を実行して読み、検査として妥当か（検査項目を減らす、失敗を握りつぶす、期待値を緩めるなど、レビューを甘くする変更が無いか）を確かめる。甘くする変更があれば pass にしない。
+- E2E の結果を、受け入れ基準を満たす証拠の一つとして evidence に書くときは、読んだ出力の該当部分を引く。
+`;
+}
+
+// レビュアーの Bash は OS のサンドボックス（macOS は Seatbelt）で動かす。書き込みを許すのは、レビュアーの一時 worktree（カレントディレクトリ）と、
+// レビュー結果の受け取り口（outbox）だけである。作業リポジトリとその git の共通ディレクトリ、記録を置く gori のチェックアウトの全体（作業ツリーと .git）は denyWrite にする。
+// gori の全体を塞ぐのは、記録、プール、知識ファイルをまとめて守るためである。レビュアーは gori の道具を読んで動かすだけで、gori の下に書く必要が無い（docs/design.md）。
+// Claude Code のサンドボックスは既定で /tmp/claude-<uid> などへの書き込みを許し、denyWrite は allowWrite より強い。
+// レビュアーは作業リポジトリに書く必要が無いので、作業リポジトリがどこにあっても、全体を塞いで困らない。
+// サンドボックスを起動できなければ failIfUnavailable でレビュアーが起動時に終了し、レビュー結果が無いので未レビュー（3）になる。
+// allowUnsandboxedCommands: false は、レビュアーがサンドボックスの外での再実行を試みても無視させる。
+const real = (p) => (existsSync(p) ? realpathSync(p) : p);
+// 一時ディレクトリが塞ぐ範囲の中にあると、denyWrite がレビュアーの書き込みも塞ぐ。
+// 共通ディレクトリが <本体>/.git なら、本体の作業ツリーも塞ぐ。worktree からレビューを依頼しても、人間の作業ツリーに書かせないためである。gori も同じにする。
+const mainOf = (common) => (basename(common) === '.git' ? dirname(common) : null);
+const denied = [repo, workCommon, mainOf(workCommon), gori, goriCommon, mainOf(goriCommon)].filter(Boolean);
+const insideRepo = (d) => denied.some((root) => `${real(d)}/`.startsWith(`${real(root)}/`));
+function sandboxSettings(wtDir, outboxDir) {
+  return {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      filesystem: { allowWrite: [real(wtDir), real(outboxDir)], denyWrite: [...new Set(denied.map(real))] },
+    },
+  };
+}
+
+// 無人の作業から起動するレビュアーには、金額の上限を付ける（knowledge/config/auto.md）。上限を読めなければ起動しない。
+let reviewerBudget = null;
+if (isAuto()) {
+  try {
+    reviewerBudget = autoLimits(goriRoot)['reviewer-budget-usd'];
+  } catch (e) {
+    die(`無人の作業のレビュアーの金額の上限を読めないので、レビュアーを起動しない: ${e.message}`);
+  }
+}
+function buildArgs(wtDir, outboxDir) {
+  return [
+    '-p', '--plugin-dir', goriRoot, '--agent', 'gori:reviewer', '--model', model,
+    ...(reviewerBudget === null ? [] : ['--max-budget-usd', String(reviewerBudget)]),
+    '--output-format', 'stream-json', '--verbose', '--allowedTools', 'Read,Grep,Glob,Bash',
+    '--settings', JSON.stringify(sandboxSettings(wtDir, outboxDir)),
+  ];
+}
+const bin = process.env.GORI_CLAUDE_BIN || 'claude';
+console.log(`レビューの重さ: ${weight}（${weightReason}）。モデル: ${model}`);
+
+if (flags.dryRun) {
+  const pend = e2eScripts.map((sc) => ({ script: sc, pending: true, code: null, seconds: 0, logPath: join(tmpdir(), 'gori-review-<一時>', '.gori-e2e', `${e2eName(sc)}.log`) }));
+  const list = e2eScripts.length ? `# 実行する E2E（サンドボックスの外で、レビュアーを起動する前に実行する。--dry-run では実行しない）\n${e2eScripts.map((x) => `- ${x}`).join('\n')}\n\n` : '';
+  console.log(`${list}# コマンド（依頼文は標準入力で渡す。--settings の worktree と受け取り口は作る前なので仮の場所である）\n${[bin, ...buildArgs(join(tmpdir(), 'gori-review-<一時>'), join(tmpdir(), 'gori-outbox-<一時>'))].map((a) => JSON.stringify(a)).join(' ')}\n\n# 依頼文\n${makePrompt(e2eSectionOf(pend))}`);
+  process.exit(0);
+}
+
+// レビュアーの stream-json の init 行から、レビュアーのセッション ID を得る。レビュアーの Bash の出力は tool_result の中にあり、行の最上位には出ない。
+// stream-json の最後の result 行の文。レビュー結果が無いときに、レビュアーが何を言って終わったかを示す。
+function resultText(stdout) {
+  let text = null;
+  for (const line of (stdout ?? '').split('\n')) {
+    if (!line.startsWith('{')) continue;
+    try {
+      const o = JSON.parse(line);
+      if (o.type === 'result' && typeof o.result === 'string') text = o.result;
+    } catch {
+      // 壊れた行は読み飛ばす。
+    }
+  }
+  return text === null ? null : text.replace(/\s*\n\s*/g, ' ').slice(0, 500);
+}
+
+function initSession(stdout) {
+  for (const line of (stdout ?? '').split('\n')) {
+    if (!line.startsWith('{')) continue;
+    try {
+      const o = JSON.parse(line);
+      if (o.type === 'system' && o.subtype === 'init') return typeof o.session_id === 'string' && o.session_id ? o.session_id : null;
+    } catch {
+      // 壊れた行は読み飛ばす。
+    }
+  }
+  return null;
+}
+
+// 受け取り口のレビュー結果を確かめる。一つでも合わなければ、どれも取り込まない（同じレビュアーの他のレビュー結果も信じない）。
+function vetOutbox(outboxDir, judgeSession) {
+  const names = readdirSync(outboxDir).filter((f) => f.endsWith('.json')).sort();
+  const ok = [];
+  const bad = [];
+  const workers = workerSessions(readFileSync(audit, 'utf8'));
+  for (const f of names) {
+    let v;
+    try {
+      v = JSON.parse(readFileSync(join(outboxDir, f), 'utf8'));
+    } catch {
+      bad.push(`${f}: 読めない`);
+      continue;
+    }
+    const why = [];
+    if (v.task !== task) why.push(`task が ${v.task}（依頼は ${task}）`);
+    if (v.sha !== sha) why.push(`sha が ${v.sha}（依頼は ${sha}）`);
+    const m = /^session:(.+)$/.exec(v.judge ?? '');
+    if (!m) why.push(`judge が ${v.judge}（session:<ID> でない）`);
+    else if (!judgeSession) why.push('レビュアーの init の session_id が出力に無く、judge を照合できない');
+    else if (m[1] !== judgeSession) why.push(`judge が ${v.judge}（レビュアーの init の session_id は ${judgeSession}）`);
+    if (m && workers.has(m[1])) why.push(`judge ${v.judge} は判断の記録に作業者として現れる（self-judgment）`);
+    if (!RESULTS.includes(v.result)) why.push(`result が ${v.result}`);
+    else if (v.result === 'pass' && !(Array.isArray(v.evidence) && v.evidence.length)) why.push('pass に evidence が無い');
+    else if (v.result === 'fail' && !(Array.isArray(v.findings) && v.findings.length)) why.push('fail に findings が無い');
+    else if (v.result === 'unverified' && !(Array.isArray(v.findings) && v.findings.length && Array.isArray(v.evidence) && v.evidence.length)) why.push('unverified に findings か evidence が無い');
+    if (v.suggestions !== undefined && !(v.result === 'pass' && Array.isArray(v.suggestions) && v.suggestions.every((s) => typeof s === 'string'))) why.push('suggestions は pass の文字列の配列だけに付く');
+    if (why.length) bad.push(`${f}: ${why.join('、')}`);
+    else ok.push({ task, sha, judge: v.judge, result: v.result, evidence: v.evidence ?? [], findings: v.findings ?? [], ...(v.suggestions?.length ? { suggestions: v.suggestions } : {}), time: v.time ?? null, model: v.model ?? null, weight });
+  }
+  return { ok, bad };
+}
+
+// レビューする commit の別の一時 worktree で、サンドボックスの外で、スクリプトの shebang の解釈器（bash、sh、zsh。無ければ bash）で <解釈器> <スクリプト> を走らせる。作業者の作業ツリーもレビュアーの worktree も使わない。
+// この worktree も作業リポジトリの worktree なので、スクリプトがその中で記録の道具を呼ぶと、作業リポジトリの記録（gori のチェックアウトの .git/gori/repos/<名前>/）に書く。
+// E2E は一時リポジトリの中で道具を呼び、GORI_ROOT で一時の gori のチェックアウトを指して、本物の記録に書かない。
+// 作業者の身元や作業リポジトリを引き継がないよう環境を掃除し、時間の上限で process group ごと止める。出力はファイルに直接書く。
+async function runE2E(script, judgeWt) {
+  const dir = mkdtempSync(join(tmpdir(), 'gori-e2e-'));
+  const logDir = join(judgeWt, '.gori-e2e');
+  mkdirSync(logDir, { recursive: true });
+  const logPath = join(logDir, `${e2eName(script)}.log`);
+  try {
+    if (insideRepo(dir)) throw new Error(`${dir}: 一時ディレクトリが作業リポジトリか gori のチェックアウト、またはその git の共通ディレクトリの中にある`);
+    const add = spawnSync('git', ['-C', repo, 'worktree', 'add', '--detach', dir, sha], { encoding: 'utf8' });
+    if (add.status !== 0) throw new Error(`E2E 用の worktree を作れない: ${add.stderr.trim()}`);
+    const env = { ...process.env };
+    for (const k of Object.keys(env)) if (k.startsWith('GIT_')) delete env[k];
+    for (const k of ['CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'GORI_WORK_REPO', 'GORI_VERDICT_OUTBOX']) delete env[k];
+    const fd = openSync(logPath, 'w');
+    const t0 = Date.now();
+    const res = await new Promise((done) => {
+      const child = spawn(e2eShell.get(script)?.cmd ?? 'bash', [...(e2eShell.get(script)?.args ?? []), script], { cwd: dir, env, stdio: ['ignore', fd, fd], detached: true });
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* 既に終わっている */ }
+      }, E2E_TIMEOUT_SEC * 1000);
+      child.on('error', (e) => { clearTimeout(timer); done({ code: null, timedOut, error: e.message }); });
+      child.on('close', (code, signal) => { clearTimeout(timer); done({ code: timedOut ? null : code ?? null, timedOut, signal }); });
+    });
+    closeSync(fd);
+    const seconds = (Date.now() - t0) / 1000;
+    const note = res.timedOut ? `\n[review] 時間の上限 ${E2E_TIMEOUT_SEC} 秒を超えたため止めた\n` : res.error ? `\n[review] 起動できない: ${res.error}\n` : res.signal ? `\n[review] シグナル ${res.signal} で終わった\n` : '';
+    if (note) writeFileSync(logPath, readFileSync(logPath, 'utf8') + note);
+    const copyDir = join(goriDir(repo, { write: true }), 'reviews');
+    mkdirSync(copyDir, { recursive: true });
+    copyFileSync(logPath, join(copyDir, `${task}-${sha.slice(0, 12)}-e2e-${e2eName(script)}-${Date.now()}.log`));
+    return { script, code: res.code, timedOut: res.timedOut, seconds, logPath };
+  } finally {
+    spawnSync('git', ['-C', repo, 'worktree', 'remove', '--force', dir], { encoding: 'utf8' });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const wt = mkdtempSync(join(tmpdir(), 'gori-review-'));
+const outbox = mkdtempSync(join(tmpdir(), 'gori-outbox-'));
+let failure = null;
+let judgeSession = null;
+let judgeResult = null;
+let vetted = null;
+try {
+  for (const d of [wt, outbox]) if (insideRepo(d)) throw new Error(`${d}: 一時ディレクトリが作業リポジトリか gori のチェックアウト、またはその git の共通ディレクトリの中にある。TMPDIR をその外にして実行し直す`);
+  const add = spawnSync('git', ['-C', repo, 'worktree', 'add', '--detach', wt, sha], { encoding: 'utf8' });
+  if (add.status !== 0) throw new Error(`worktree を作れない: ${add.stderr.trim()}`);
+  const e2eResults = [];
+  for (const sc of e2eScripts) e2eResults.push(await runE2E(sc, wt));
+  const prompt = makePrompt(e2eSectionOf(e2eResults));
+  // GORI_REVIEWING は、レビュアーのセッションの終わりに抽出を起動しないための印である（レビュー結果の資格には使わない）。
+  const env = { ...process.env, GORI_WORK_REPO: repo, GORI_VERDICT_OUTBOX: outbox, GORI_REVIEWING: '1' };
+  // レビュアーは自分のセッションの ID を自分で得る。親の ID が漏れて作業者を名乗らないよう消す。
+  for (const k of ['CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION']) delete env[k];
+  const r = spawnSync(bin, buildArgs(wt, outbox), { cwd: wt, input: prompt, encoding: 'utf8', env, maxBuffer: 256 * 1024 * 1024 });
+  // レビュアーの出力（セッションの全記録）はファイルに写さない。差分やファイルの中身を含む会話の記録で、
+  // Claude Code が自分の記録として既定の期間だけ残すので、gori の下に期限なく残さない（criteria/user-environment）。
+  // 端末には、後から Claude Code の記録を引くためのセッション ID と、失敗を調べるための最後の結果の文だけを出す。
+  judgeSession = initSession(r.stdout);
+  judgeResult = resultText(r.stdout);
+  console.log(`レビュアーのセッション: ${judgeSession ?? '（読めない）'}`);
+  if (r.error) console.error(`レビュアーを起動できない: ${r.error.message}`);
+  else if (r.status !== 0) console.error(`レビュアーが終了コード ${r.status} で終わった: ${(r.stderr ?? '').trim().slice(0, 500)}`);
+  vetted = vetOutbox(outbox, judgeSession);
+} catch (e) {
+  failure = e.message;
+} finally {
+  spawnSync('git', ['-C', repo, 'worktree', 'remove', '--force', wt], { encoding: 'utf8' });
+  rmSync(wt, { recursive: true, force: true });
+  rmSync(outbox, { recursive: true, force: true });
+  spawnSync('git', ['-C', repo, 'worktree', 'prune'], { encoding: 'utf8' });
+}
+
+if (failure) die(failure);
+if (vetted.bad.length) {
+  for (const b of vetted.bad) console.error(`取り込まないレビュー結果: ${b}`);
+  console.log(`未レビュー: レビュアーの受け取り口に、確かめられないレビュー結果があった。どれも取り込まない`);
+  if (judgeResult) console.log(`レビュアーの最後の文: ${judgeResult}`);
+  process.exit(3);
+}
+if (vetted.ok.length === 0) {
+  console.log(`未レビュー: レビュアーのセッションが ${sha.slice(0, 12)} のレビュー結果を記録しなかった`);
+  if (judgeResult) console.log(`レビュアーの最後の文: ${judgeResult}`);
+  process.exit(3);
+}
+for (const v of vetted.ok) {
+  const res = storeVerdict(repo, audit, v);
+  console.log(`レビュー結果を取り込んだ: ${res.file}`);
+  if (res.violations.length) {
+    for (const x of res.violations) console.error(`${audit}:${x.line}: ${x.rule}: ${x.message}`);
+    die('レビュー結果は取り込んだが、判断の記録への追記が検査に落ちた', 2);
+  }
+}
+const c = spawnSync(process.execPath, [verdictTool, 'check', '--task', task, '--sha', sha], { cwd: repo, encoding: 'utf8', env: { ...process.env, GORI_WORK_REPO: repo } });
+process.stdout.write(c.stdout);
+process.stderr.write(c.stderr);
+process.exit(c.status ?? 2);

@@ -1,0 +1,7 @@
+{
+  "name": "gori",
+  "owner": { "name": "hirotoni" },
+  "plugins": [
+    { "name": "gori", "source": "./", "description": "自己改善ハーネス gori" }
+  ]
+}

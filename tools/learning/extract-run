@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+// 学びの抽出を、利用者の作業を待たせない形で一回走らせる（H-I10）。SessionEnd フックからも、人間の手からも呼べる。
+// このマシンの gori のチェックアウト（プラグインのルート）を cwd にして claude -p "/gori:extract" を起動し、
+// 続けて手順書の候補を拾う claude -p "/gori:procedure-scout" を起動するだけで、git には触れない。
+// ログには終了コードと所要時間と起票数だけを書く。会話の中身は書かない。
+import { spawn } from 'node:child_process';
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { goriHome, logSkip, resolveRoot } from '../lib/learning.mjs';
+import { modelFor } from '../lib/models.mjs';
+import { reposDir } from '../lib/pool.mjs';
+
+const USAGE = `使い方: extract-run [--dry-run] [--session <ID>]...
+環境変数: GORI_HOME（既定 $XDG_STATE_HOME/gori、XDG_STATE_HOME が無ければ ~/.local/state/gori）、GORI_EXTRACT_TIMEOUT_MINUTES（既定 30）、GORI_CLAUDE_BIN、GORI_ROOT（テスト用。プラグインのルートの差し替え）`;
+
+const argv = process.argv.slice(2);
+const flags = {};
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--dry-run') flags.dryRun = true;
+  else if (argv[i] === '--session' && argv[i + 1]) (flags.sessions ??= []).push(argv[++i]);
+  else {
+    console.error(USAGE);
+    process.exit(2);
+  }
+}
+
+const here = dirname(fileURLToPath(import.meta.url));
+function cleanEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const k of Object.keys(env)) if (k.startsWith('GIT_')) delete env[k];
+  return env;
+}
+
+const home = goriHome();
+// 書き込み先のチェックアウト。gori のチェックアウトでなければ理由を一行だけログに書き、終了コード 0 で終わる。
+const found = resolveRoot(process.env.CLAUDE_PLUGIN_ROOT || resolve(here, '..', '..'));
+if (!found.root) {
+  if (!flags.dryRun) logSkip(home, found.reason);
+  console.error(`extract-run: ${found.reason}`);
+  process.exit(flags.dryRun ? 2 : 0);
+}
+const repo = found.root;
+
+const minutes = Number(process.env.GORI_EXTRACT_TIMEOUT_MINUTES ?? 30);
+const timeoutMs = Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 30 * 60_000;
+const bin = process.env.GORI_CLAUDE_BIN || 'claude';
+
+let model = 'sonnet';
+try {
+  model = modelFor(repo, 'extract-run');
+} catch {
+  // 表に extract-run の行が無ければ sonnet。
+}
+// 手順書の候補は、表に procedure-scout の行が無ければ推測でモデルを決めず起動しない。
+// --session は抽出をセッションに絞る指定で、手順書の候補はセッションと関わりが無いので起動しない。
+let scoutModel = null;
+let scoutSkip = null;
+if (flags.sessions) scoutSkip = '--session';
+else {
+  try {
+    scoutModel = modelFor(repo, 'procedure-scout');
+  } catch {
+    scoutSkip = 'config/models に procedure-scout の行が無い';
+  }
+}
+const buildArgs = (prompt, m) => [
+  // --allowedTools は複数の値を取るので、依頼文は先に置く（後ろに置くと値として食われる）。
+  '-p', prompt, '--model', m, '--plugin-dir', repo,
+  '--settings', '{"enabledPlugins":{"gori@gori":false}}',
+  '--allowedTools', 'Bash,Read,Grep,Glob,Agent,Task,Skill,Write',
+];
+
+if (flags.dryRun) {
+  console.log(`# 作業ディレクトリ: ${repo}`);
+  console.log(`# 環境変数: GORI_EXTRACTING=1${flags.sessions ? ` GORI_EXTRACT_SESSIONS=${flags.sessions.join(',')}` : ''}`);
+  console.log(`# 時間の上限: ${minutes} 分`);
+  const cmd = (prompt, m) => [bin, ...buildArgs(prompt, m)].map((a) => JSON.stringify(a)).join(' ');
+  console.log(`# コマンド\n${cmd('/gori:extract', model)}`);
+  console.log(scoutSkip ? `# 手順書の候補: 起動しない（${scoutSkip}）` : `# 手順書の候補のコマンド\n${cmd('/gori:procedure-scout', scoutModel)}`);
+  process.exit(0);
+}
+
+// 排他。ロックの持ち主が生きていれば何もせず終わり、生きていなければ古い印として取り除く。
+const state = join(home, 'state');
+const lockFile = join(state, 'extract.lock');
+mkdirSync(state, { recursive: true });
+mkdirSync(join(home, 'logs'), { recursive: true });
+const alive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+};
+function acquire() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      writeFileSync(lockFile, `${process.pid}\n`, { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let held = NaN;
+      try {
+        held = Number(readFileSync(lockFile, 'utf8').trim());
+      } catch {
+        continue;
+      }
+      if (alive(held)) return false;
+      rmSync(lockFile, { force: true });
+    }
+  }
+  return false;
+}
+if (!acquire()) {
+  console.log('抽出は既に動いている。何もしない');
+  process.exit(0);
+}
+const release = () => {
+  try {
+    if (Number(readFileSync(lockFile, 'utf8').trim()) === process.pid) rmSync(lockFile, { force: true });
+  } catch {
+    // 既に無い。
+  }
+};
+
+const started = Date.now();
+const stamp = new Date(started).toISOString().replace(/[:.]/g, '-');
+const logFile = join(home, 'logs', `extract-${stamp}.log`);
+// 起票数は、このチェックアウトの下の全リポジトリのプール（gori/repos/<名前>/pool/）の件数の差で数える。
+const itemsIn = (dir) => {
+  try {
+    const root = reposDir(dir);
+    let n = 0;
+    for (const d of readdirSync(root, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      try {
+        n += readdirSync(join(root, d.name, 'pool')).filter((f) => f.endsWith('.md')).length;
+      } catch {
+        // pool/ の無いリポジトリは 0 件。
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+};
+const written = (exit, scoutExit, extra = '') => {
+  writeFileSync(logFile, `exit=${exit}\nprocedure-scout-exit=${scoutExit}\nseconds=${Math.round((Date.now() - started) / 1000)}\nfiled=${Math.max(0, itemsIn(repo) - itemsBefore)}\n${extra}`);
+  console.log(`ログ: ${logFile}`);
+};
+const itemsBefore = itemsIn(repo);
+
+let note = '';
+const env = cleanEnv({ GORI_EXTRACTING: '1', ...(flags.sessions ? { GORI_EXTRACT_SESSIONS: flags.sessions.join(',') } : {}) });
+for (const k of ['CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION']) delete env[k];
+// 一回の起動。prefix はログの注記の頭（抽出は空、手順書の候補は procedure-scout-）。
+async function launch(prompt, m, prefix) {
+  try {
+    return await new Promise((done) => {
+      const child = spawn(bin, buildArgs(prompt, m), { cwd: repo, env, stdio: 'ignore', detached: true });
+      let timedOut = false;
+      const kill = (sig) => {
+        try {
+          process.kill(-child.pid, sig);
+        } catch {
+          // 既に終わっている。
+        }
+      };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        kill('SIGTERM');
+        setTimeout(() => kill('SIGKILL'), 5000).unref();
+      }, timeoutMs);
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        note += `${prefix}spawn-error=${e.code ?? 'unknown'}\n`;
+        done(127);
+      });
+      child.on('close', (c, sig) => {
+        clearTimeout(timer);
+        if (timedOut) note += `${prefix}timeout=${minutes}min\n`;
+        done(timedOut ? 124 : c ?? (sig ? 128 : 1));
+      });
+    });
+  } catch (e) {
+    note += `${prefix}error=${e.message.split('\n')[0]}\n`;
+    console.error(`extract-run: ${e.message}`);
+    return 1;
+  }
+}
+// 手順書の候補は抽出の結果と関わりが無いので、抽出が失敗しても起動する。
+const exit = await launch('/gori:extract', model, '');
+let scoutExit = '-';
+if (scoutSkip) note += `procedure-scout-skipped=${scoutSkip}\n`;
+else scoutExit = await launch('/gori:procedure-scout', scoutModel, 'procedure-scout-');
+written(exit, scoutExit, note);
+release();
+process.exit(exit === 0 && (scoutExit === '-' || scoutExit === 0) ? 0 : 1);

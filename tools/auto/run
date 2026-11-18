@@ -1,0 +1,361 @@
+#!/usr/bin/env node
+// 無人の作業を一回分だけ走らせる（docs/design.md の「自律起動」）。
+// 全リポジトリのプールから kind が learning の todo の一件を選び、そのリポジトリで claude -p を起動して、レビューに合格するところまで進めさせる。
+// 外への送信はしない。main への取り込みは、gori のプールの学びの一件に限り、作業者が終わった後にこの道具が行う。柵（tools/lib/auto.mjs の fenceEnv）と上限（knowledge/config/auto.md）を付けて起動する。
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from '../lib/args.mjs';
+import { FIX_TARGET, parseAudit } from '../lib/audit.mjs';
+import { BILLING_ENV, autoLimits, fenceEnv, isAuto } from '../lib/auto.mjs';
+import { alive, autoDir, heldIds, loadRuns, sessionTask, takenIds } from '../lib/auto-status.mjs';
+import { parseFrontmatterLines } from '../lib/frontmatter.mjs';
+import { modelFor } from '../lib/models.mjs';
+import { goriCheckout, loadItems, mainBranch, reposDir, runGit } from '../lib/pool.mjs';
+
+const USAGE = `使い方: run [--dry-run]
+kind が learning の todo の一件（学び）を一つ選び、無人の作業として claude -p で進める。選べる一件が無ければ何も起動しない。improvement と procedure の一件は選ばない。
+gori のプールの学びは、合格したら手元の main に fast-forward で取り込む。ほかのリポジトリの学びは、合格で止める。
+最後の行に RESULT=<none|locked|daily-limit|pass|merged|stopped|failed> を出す。
+終了コード: 0 起動しなかったか、合格か取り込みか停止で終わった、1 失敗（起動できない、0 以外の終了、時間切れ、金額の上限、main か作業ツリーが変わった）、2 設定を読めない
+環境変数: GORI_CLAUDE_BIN、GORI_ROOT（テスト用。gori のチェックアウトの差し替え）`;
+const { flags, positional } = parseArgs(process.argv.slice(2), { bool: ['dry-run', 'help'] }, USAGE);
+if (flags.help) {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (positional.length) {
+  console.error(`引数 ${positional.join(' ')} を読めない\n${USAGE}`);
+  process.exit(2);
+}
+
+const toolRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const finish = (result, code, msg) => {
+  if (msg) (code === 0 ? console.log : console.error)(msg);
+  console.log(`RESULT=${result}`);
+  process.exit(code);
+};
+
+// 記録と設定を読む gori のチェックアウト。上限と作業者のモデルを読めなければ、何も起動しない。
+let gori;
+let limits;
+let model;
+let repos;
+try {
+  gori = goriCheckout(toolRoot);
+  limits = autoLimits(gori);
+  model = modelFor(gori, 'implementer');
+  repos = reposDir(gori);
+} catch (e) {
+  finish('failed', 2, `run: 設定を読めないので起動しない: ${e.message}`);
+}
+const bin = process.env.GORI_CLAUDE_BIN || 'claude';
+const autoPath = autoDir(gori);
+const runsDir = join(autoPath, 'runs');
+const lockFile = join(autoPath, 'run.lock');
+
+// 全リポジトリの kind が learning の todo の一件を、起票が古い順（ID の順）に並べる。improvement と procedure は人間が会話で進めるので選ばない。着手済みの一件と、前の実行が止まって人間を待っている一件も選ばない。リポジトリのパスを読めないか、パスが無いリポジトリは飛ばして知らせる。
+function candidates() {
+  const out = [];
+  if (!existsSync(repos)) return out;
+  const runs = loadRuns(gori);
+  for (const name of readdirSync(repos).sort()) {
+    const dir = join(repos, name);
+    const items = loadItems(join(dir, 'pool')).filter((it) => it.fields.status === 'todo' && it.fields.kind === 'learning');
+    if (items.length === 0) continue;
+    let path = null;
+    try {
+      path = parseFrontmatterLines(readFileSync(join(dir, 'repo.yml'), 'utf8').replace(/\r\n/g, '\n').split('\n'), 1).path?.value ?? null;
+    } catch {
+      // 下で飛ばす。
+    }
+    if (!path || !existsSync(path) || runGit(path, ['rev-parse', '--show-toplevel']) === null) {
+      console.error(`run: ${name} のリポジトリの場所（repo.yml の path）を読めないか、そこに無いので、${items.length} 件の todo を飛ばす`);
+      continue;
+    }
+    const taken = takenIds(join(dir, 'audit'));
+    const held = heldIds(gori, name, runs);
+    for (const it of items) if (!taken.has(it.id) && !held.has(it.id)) out.push({ name, repo: path, id: it.id, title: it.fields.title ?? '', kind: it.fields.kind ?? '' });
+  }
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : a.name < b.name ? -1 : 1));
+}
+
+// 一件のリポジトリで、その一件を指す最新の作業を探す。
+function taskOf(name, id) {
+  const taken = takenIds(join(repos, name, 'audit'));
+  return taken.get(id) ?? null;
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+const dayOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+const stampOf = (d) => `${dayOf(d)}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+// その日に起動した回数。アカウントの確認で起動しなかった記録（launched が false）は数えない。読めない記録は、起動した一回に数える。
+const runsToday = (now) => loadRuns(gori).filter((r) => r.name.startsWith(`${dayOf(now)}-`) && r.launched !== false).length;
+
+// 無人の作業への依頼文。手順書の承認の手順の扱いは、docs/design.md の「自律起動」の「承認」に従う。
+const poolTool = join(toolRoot, 'tools', 'records', 'pool');
+const prompt = (c) => `これは無人の作業である（環境変数 GORI_AUTO）。人間は見ておらず、尋ねても返事は無い。
+
+改善候補のプールの一件 ${c.id}（${c.title}）を進める。
+\`${poolTool} show ${c.id}\` で本文と受け入れ条件を読み、振り分けの指示に従って手順書を選び、レビューに合格するところまで進める。
+
+作業リポジトリは ${c.repo} である。道具はこのディレクトリから絶対パスで呼び、道具の置き場所へ cd しない。道具は、呼ばれたディレクトリから作業リポジトリを決めるためである。
+
+守ること:
+- 受け入れ条件の行は \`pool:${c.id}\` の一行だけにする。人間がこの一件を todo に上げたことが、受け入れ条件の承認である。承認の行は書かない（道具が拒む）。
+- 手順書が人間の承認を求めて止まるとしている手順のうち、受け入れ条件と変更の内容の承認は、todo で済んでいる。その手順は step-done にし、evidence にこの一件が todo であることを書く。変更の中身は、main に入れる前に人間が確かめる。
+- 受け入れ条件を足すか、訂正するか、取り下げる必要が出たら、続けずに止まる。
+- レビューに合格したら（verdict check が 0）、そこで終える。done の行を書かず、main に取り込まず、プールの一件を done にせず、push も PR の作成もしない。これらは人間か、この作業を起動した道具が行う（道具と git のフックが拒む。回避しない）。
+- 手順書の最後の手順が、main に取り込む手順か、プールの一件を done にする手順なら、step-done も step-skip も書かずに残す（レビューと取り込みが一つの手順なら、その手順ごと残す）。残してよいのは最後の二つまでで、それより前の手順は、すべて step-done か step-skip にしてから終える。
+- 止まるとき（受け入れ条件を直す必要が出た、レビューが未レビューで終わった、確認できずが続いた、条件が曖昧で観察では決められない、道具に拒まれた）は、\`gori:pause\` の能力で pause の行に理由を書いて終える。
+- 最後に、合格したか止まったかと、その理由を一文で述べる。`;
+
+const buildArgs = (c, pluginDir) => [
+  // --allowedTools と --disallowedTools は複数の値を取るので、依頼文は先に置く。
+  '-p', prompt(c), '--model', model, '--output-format', 'json',
+  '--max-budget-usd', String(limits['worker-budget-usd']),
+  '--plugin-dir', pluginDir, '--settings', '{"enabledPlugins":{"gori@gori":false}}',
+  '--allowedTools', 'Bash,Read,Grep,Glob,Edit,Write,Agent,Task,Skill',
+  // 柵は git のフックと gh の未ログインで守る。この指定は別の書き方の呼び出しに当たらないので、重ねる補助である。
+  '--disallowedTools', 'Bash(git push *)', 'Bash(gh pr create *)',
+];
+
+// 担当に渡すプラグインの場所。Claude Code は --plugin-dir の下のファイルを、Write と Edit で sensitive file として書かせない。
+// 担当の worktree は gori のチェックアウトの .worktree/ の下にあるので、チェックアウトを渡すと、gori の作業で知識ファイルを書けない。
+// そこで、記録の場所（git の共通ディレクトリ）の下に、main を detached で checkout した worktree を置いて渡す。記録は同じ共通ディレクトリから読むので変わらない。
+// 毎回 main の先端に合わせ、前の担当が残したファイルを消す。用意できなければ、理由を返す。
+const pluginDir = join(autoPath, 'plugin');
+function preparePlugin() {
+  const b = mainBranch(gori);
+  const sha = b ? runGit(gori, ['rev-parse', `refs/heads/${b}`]) : null;
+  if (!sha) return 'gori のチェックアウトの main を読めない';
+  const registered = (runGit(gori, ['worktree', 'list', '--porcelain']) ?? '').split('\n').some((l) => l === `worktree ${pluginDir}`);
+  if (registered && existsSync(pluginDir)) {
+    if (runGit(pluginDir, ['checkout', '-q', '--detach', '--force', sha]) === null || runGit(pluginDir, ['clean', '-q', '-fdx']) === null) return `${pluginDir} を main の先端に合わせられない`;
+  } else {
+    rmSync(pluginDir, { recursive: true, force: true });
+    runGit(gori, ['worktree', 'prune']);
+    if (runGit(gori, ['worktree', 'add', '-q', '--detach', '--force', pluginDir, sha]) === null) return `${pluginDir} に main の worktree を作れない`;
+  }
+  return runGit(pluginDir, ['rev-parse', 'HEAD']) === sha ? null : `${pluginDir} が main の先端を指していない`;
+}
+
+// 起動の環境。従量課金に切り替わる変数と、親のセッションの身元と、gh の認証を取り除き、柵を付ける。
+// origin から手元の main を進める道具（sync-main、worktree）は、柵に拒まれるので、進めない指定を付ける。
+function childEnv() {
+  const env = { ...process.env };
+  for (const k of [...BILLING_ENV, 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) delete env[k];
+  const ghEmpty = join(autoPath, 'gh-empty');
+  mkdirSync(ghEmpty, { recursive: true });
+  return { ...fenceEnv(toolRoot, env), GH_CONFIG_DIR: ghEmpty, GORI_IGNORE_UPSTREAM: '1' };
+}
+
+// アカウントの層。ログインが claude.ai のサブスクリプションだと確かめられず、または設定に apiKeyHelper があれば、起動しない。
+function accountProblem(c, env) {
+  const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+  for (const f of [join(configDir, 'settings.json'), join(c.repo, '.claude', 'settings.json'), join(c.repo, '.claude', 'settings.local.json')]) {
+    if (!existsSync(f)) continue;
+    let s;
+    try {
+      s = JSON.parse(readFileSync(f, 'utf8'));
+    } catch {
+      return `${f} を読めず、apiKeyHelper が無いことを確かめられない`;
+    }
+    if (s && Object.hasOwn(s, 'apiKeyHelper')) return `${f} に apiKeyHelper がある（従量課金に切り替わる）`;
+  }
+  const r = spawnSync(bin, ['auth', 'status'], { encoding: 'utf8', env, timeout: 60_000 });
+  let st = null;
+  try {
+    st = JSON.parse(r.stdout);
+  } catch {
+    // 下で失敗にする。
+  }
+  if (r.error || !st) return `${bin} auth status の出力を読めない`;
+  if (st.loggedIn !== true || st.authMethod !== 'claude.ai' || st.apiProvider !== 'firstParty') return `ログインが claude.ai のサブスクリプションでない（loggedIn=${st.loggedIn} authMethod=${st.authMethod} apiProvider=${st.apiProvider}）`;
+  return null;
+}
+
+// 本体のチェックアウトの main の位置と未 commit の変更。起動の前と後で比べる。
+function stateOf(repo) {
+  const b = mainBranch(repo);
+  return { main: b ? runGit(repo, ['rev-parse', `refs/heads/${b}`]) : null, dirty: runGit(repo, ['status', '--porcelain']) };
+}
+
+const list = candidates();
+const now = new Date();
+if (flags['dry-run']) {
+  console.log(`# 上限: ${Object.entries(limits).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  console.log(`# 今日の起動: ${runsToday(now)} 回`);
+  console.log(`# 選べる todo: ${list.length} 件${list.length ? `（${list.map((c) => `${c.name}/${c.id}`).join('、')}）` : ''}`);
+  if (list.length) console.log(`# 作業ディレクトリ: ${list[0].repo}\n# コマンド\n${[bin, ...buildArgs(list[0], pluginDir)].map((a) => JSON.stringify(a)).join(' ')}`);
+  finish('none', 0);
+}
+if (list.length === 0) finish('none', 0, '選べる todo の一件が無い。何も起動しない');
+
+// 排他。ロックの持ち主が生きていれば何もせず終わり、生きていなければ古いロックとして取り除く。
+mkdirSync(runsDir, { recursive: true });
+function acquire() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      writeFileSync(lockFile, `${process.pid}\n`, { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let held = NaN;
+      try {
+        held = Number(readFileSync(lockFile, 'utf8').trim());
+      } catch {
+        continue;
+      }
+      if (alive(held)) return false;
+      rmSync(lockFile, { force: true });
+    }
+  }
+  return false;
+}
+if (!acquire()) finish('locked', 0, '無人の作業は既に動いている。何も起動しない');
+const release = () => {
+  try {
+    if (Number(readFileSync(lockFile, 'utf8').trim()) === process.pid) rmSync(lockFile, { force: true });
+  } catch {
+    // 既に無い。
+  }
+};
+process.on('exit', release);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(1));
+
+if (runsToday(now) >= limits['runs-per-day']) finish('daily-limit', 0, `今日は ${runsToday(now)} 回起動した。一日の上限（${limits['runs-per-day']} 回）に達したので、何も起動しない`);
+
+const c = list[0];
+const env = childEnv();
+// 実行の記録。起動の前に書き、終わったら結果で書き直す。一日の回数は、このファイルから数える。
+const recordFile = join(runsDir, `${stampOf(now)}-${process.pid}.json`);
+const record = { started: now.toISOString(), pool: `${c.name}/${c.id}`, repo: c.repo, model, outcome: 'running' };
+const save = (more) => writeFileSync(recordFile, `${JSON.stringify(Object.assign(record, more), null, 2)}\n`);
+// アカウントの層で起動しなかった失敗も、見回りと会話を始めたときの知らせから気付けるよう記録に残す。一日の回数には数えない。
+const problem = accountProblem(c, env);
+if (problem) {
+  save({ finished: new Date().toISOString(), outcome: 'failed', launched: false, reason: `起動しなかった: ${problem}` });
+  finish('failed', 1, `run: 起動しない: ${problem}。記録: ${recordFile}`);
+}
+const pluginProblem = preparePlugin();
+if (pluginProblem) {
+  save({ finished: new Date().toISOString(), outcome: 'failed', launched: false, reason: `起動しなかった: ${pluginProblem}` });
+  finish('failed', 1, `run: 起動しない: ${pluginProblem}。記録: ${recordFile}`);
+}
+save({});
+
+const before = stateOf(c.repo);
+const timeoutMs = limits['run-minutes'] * 60_000;
+console.log(`${c.name}/${c.id}（${c.title}）を無人で進める。モデル: ${model}、時間の上限: ${limits['run-minutes']} 分、金額の上限: ${limits['worker-budget-usd']} ドル`);
+const t0 = Date.now();
+const res = await new Promise((done) => {
+  const child = spawn(bin, buildArgs(c, pluginDir), { cwd: c.repo, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  let out = '';
+  let timedOut = false;
+  child.stdout.on('data', (d) => { out += d; });
+  // 標準エラーは読み捨てる。会話の中身を含みうるので、記録に写さない。
+  child.stderr.resume();
+  const kill = (sig) => {
+    try {
+      process.kill(-child.pid, sig);
+    } catch {
+      // 既に終わっている。
+    }
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill('SIGTERM');
+    setTimeout(() => kill('SIGKILL'), 5000).unref();
+  }, timeoutMs);
+  child.on('error', (e) => { clearTimeout(timer); done({ code: null, out, timedOut, error: e.message }); });
+  child.on('close', (code) => { clearTimeout(timer); done({ code, out, timedOut }); });
+});
+const seconds = Math.round((Date.now() - t0) / 1000);
+
+// claude -p --output-format json の結果。会話の中身（result の文）は記録に写さない。
+let result = null;
+try {
+  result = JSON.parse(res.out);
+} catch {
+  // 読めなければ、終了コードだけで決める。
+}
+// 受け入れ条件の行で結び付かなければ、担当のセッションが始めた作業を探す（受け入れ条件の行を書く前に止まった作業）。
+const bound = taskOf(c.name, c.id);
+const task = bound ?? sessionTask(join(repos, c.name, 'audit'), result?.session_id, stampOf(now));
+let verdict = null;
+if (task) verdict = spawnSync(process.execPath, [join(toolRoot, 'tools', 'records', 'verdict'), 'check', '--task', task], { cwd: c.repo, encoding: 'utf8', env }).status;
+const after = stateOf(c.repo);
+
+const reasons = [];
+if (res.error) reasons.push(`起動できない: ${res.error}`);
+if (res.timedOut) reasons.push(`時間の上限 ${limits['run-minutes']} 分を超えたので止めた`);
+else if (!res.error && res.code !== 0) reasons.push(`claude が終了コード ${res.code} で終わった`);
+if (result?.subtype === 'error_max_budget_usd') reasons.push(`金額の上限 ${limits['worker-budget-usd']} ドルに達して止まった`);
+else if (result?.is_error) reasons.push(`claude が失敗で終わった（${result.subtype ?? '種類は不明'}）`);
+if (after.main !== before.main) reasons.push(`本体のチェックアウトの main が動いた（${before.main?.slice(0, 12)} から ${after.main?.slice(0, 12)}）`);
+if (after.dirty !== before.dirty) reasons.push('本体のチェックアウトの未 commit の変更が、起動の前と違う');
+
+// 学びの一件の無人の取り込み（docs/design.md の「自律起動」の「止める場所」）。
+// 取り込めない理由を返す。null なら取り込んでよい。対象でない一件（学びでない、gori のプールでない）は undefined を返し、理由も出さない。
+const tool = (rel, args, opts = {}) => spawnSync(join(toolRoot, ...rel), args, { cwd: c.repo, encoding: 'utf8', ...opts });
+function mergeBlocker() {
+  let item;
+  try {
+    item = loadItems(join(repos, c.name, 'pool')).find((it) => it.id === c.id);
+  } catch {
+    return 'プールの一件を読めない';
+  }
+  if (item?.fields.kind !== 'learning' || realpathSync(c.repo) !== realpathSync(gori)) return undefined;
+  if (isAuto()) return 'この道具が無人の作業の中で呼ばれた';
+  if (item.fields.status !== 'todo') return `プールの一件が todo でない（${item.fields.status}）`;
+  let rows;
+  try {
+    rows = parseAudit(readFileSync(join(repos, c.name, 'audit', `${task}.tsv`), 'utf8')).slice(1);
+  } catch {
+    return '判断の記録を読めない';
+  }
+  const accepts = rows.filter((r) => r.row.type === 'accept');
+  if (accepts.length !== 1 || accepts[0].row.what.trim() !== `pool:${c.id}`) return `受け入れ条件の行が pool:${c.id} の一行だけでない`;
+  // 受け入れ条件の行を訂正するか取り下げた作業は、人間が見ていない条件を含むので取り込まない。ほかの行（手順や判断）の訂正は妨げない。
+  const fixed = new Set(rows.filter((r) => r.row.type === 'fix').map((r) => Number(FIX_TARGET.exec(r.row.what)?.[1])));
+  if (rows.some((r) => r.row.type === 'accept' && fixed.has(r.line))) return '受け入れ条件の行に、訂正か取り下げがある';
+  // 残っている手順は、最後の二つまで（main に取り込む手順と、プールの一件を done にする手順）に限る。
+  const steps = rows.filter((r) => r.row.type === 'step').map((r) => r.row.step);
+  const settled = new Set(rows.filter((r) => r.row.type === 'step-done' || r.row.type === 'step-skip').map((r) => r.row.step));
+  const open = steps.filter((n) => !settled.has(n));
+  if (open.length > 2 || open.some((n, i) => n !== steps[steps.length - open.length + i])) return `手順書の手順が、最後の二つより前に残っている（${open.join('、')}）`;
+  const b = mainBranch(c.repo);
+  if (!b || runGit(c.repo, ['symbolic-ref', '--short', 'HEAD']) !== b) return '本体のチェックアウトが main にいない';
+  if (runGit(c.repo, ['merge-base', '--is-ancestor', `refs/heads/${b}`, `refs/heads/${task}`]) === null) return 'main が先に進んでいて、fast-forward で入らない';
+  return { open };
+}
+
+let outcome = reasons.length ? 'failed' : verdict === 0 ? 'pass' : 'stopped';
+let reason = reasons.length ? reasons.join('。') : verdict === 0 ? 'レビューに合格した。取り込みを待つ' : task ? `${bound ? '' : '受け入れ条件の行を書く前に止まった。'}レビューに合格せずに終わった（verdict check ${verdict}）。判断の記録を読んで再開するか決める` : 'この一件を指す作業が始まらずに終わった';
+const more = {};
+if (outcome === 'pass') {
+  const block = mergeBlocker();
+  if (typeof block === 'string') reason = `レビューに合格した。無人では取り込まなかった（${block}）。取り込みを待つ`;
+  else if (block) {
+    const sha = runGit(c.repo, ['rev-parse', `refs/heads/${task}`]);
+    const m = spawnSync('git', ['-C', c.repo, 'merge', '--ff-only', task], { encoding: 'utf8' });
+    if (m.status !== 0 || runGit(c.repo, ['rev-parse', 'HEAD']) !== sha) reason = 'レビューに合格した。無人の取り込みで git merge --ff-only が失敗した。取り込みを待つ';
+    else {
+      // 取り込んだ後の記録。プールの一件を done にし、残した手順を済みにして、done の行を書く。失敗しても main は戻さず、何が残ったかを知らせる。
+      const left = [];
+      if (tool(['tools', 'records', 'pool'], ['done', c.id, '--commit', sha]).status !== 0) left.push('プールの一件を done にできなかった');
+      const log = (...a) => tool(['tools', 'records', 'log'], ['add', '--task', task, ...a]).status === 0;
+      for (const n of block.open) if (!log('--type', 'step-done', '--step', n, '--evidence', `tools/auto/run が無人で取り込んだ（${sha.slice(0, 12)}）`)) left.push(`手順 ${n} を済みにできなかった`);
+      if (!log('--type', 'done', '--what', `学び ${c.id} の適用を、無人で main に取り込んだ（${sha.slice(0, 12)}）`)) left.push('done の行を書けなかった');
+      if (tool(['tools', 'repo', 'prune-worktrees'], ['--apply']).status !== 0) left.push('worktree を片付けられなかった');
+      outcome = 'merged';
+      reason = `レビューに合格し、無人で main に取り込んだ（${sha.slice(0, 12)}）${left.length ? `。残ったこと: ${left.join('、')}` : ''}`;
+      Object.assign(more, { merged: sha, title: c.title, left });
+    }
+  }
+}
+save({ finished: new Date().toISOString(), outcome, reason, task, exit: res.code, subtype: result?.subtype ?? null, cost_usd: result?.total_cost_usd ?? null, seconds, session: result?.session_id ?? null, verdict, ...more });
+finish(outcome, outcome === 'failed' ? 1 : 0, `${c.name}/${c.id}: ${reason}${task ? `（作業 ${task}）` : ''}。記録: ${recordFile}`);

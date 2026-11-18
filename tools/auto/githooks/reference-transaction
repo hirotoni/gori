@@ -1,0 +1,28 @@
+#!/bin/sh
+# 無人の作業の柵。main と master を動かす更新（マージ、fast-forward、commit、update-ref）を拒む。
+# このフックは、tools/lib/auto.mjs の fenceEnv が渡した環境でだけ読まれる。
+# git merge と git pull は、ref を更新する前に作業ツリーとインデックスを書き換えるので、拒むだけでは持ち込んだ変更が残る。
+# そこで、拒んだ ref がこの作業ツリーの HEAD のブランチで、マージか pull（GIT_REFLOG_ACTION）のときは、git read-tree -m -u <新> <旧> で戻す。
+# 二つの木の切り替えなので、マージの前からあった未 commit の変更と追跡していないファイルは残る。
+# commit は作業ツリーを書き換えないので戻さない（戻すと、担当が書いた中身を消す）。
+[ "$1" = prepared ] || exit 0
+while read -r old new ref; do
+  case "$ref" in
+    refs/heads/main | refs/heads/master)
+      echo "auto-fence: 無人の作業は $ref を動かせない。レビューに合格したら止まり、取り込みは人間に任せる" >&2
+      case "${GIT_REFLOG_ACTION:-}" in
+        merge* | pull*)
+          if [ "$(git symbolic-ref -q HEAD)" = "$ref" ]; then
+            if git read-tree -m -u "$new" "$old" >&2; then
+              echo "auto-fence: マージが持ち込んだ変更を作業ツリーとインデックスから戻した" >&2
+            else
+              echo "auto-fence: マージが持ち込んだ変更を戻せなかった。git status で確かめる" >&2
+            fi
+          fi
+          ;;
+      esac
+      exit 1
+      ;;
+  esac
+done
+exit 0

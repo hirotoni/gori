@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+// 事例（gori の git の共通ディレクトリの下の gori/learning/cases/<id>.md）を書く唯一の入口。一度書いた事例は書き換えない。
+// 引用は自己申告を信じず、会話の記録（またはレビュー結果）の実物と突き合わせる。
+// 誤って書かれた事例は書き換えず、gori/learning/retractions/<id>.md に取り消しを一度だけ書き、件数から外す。
+import { parseArgs } from '../lib/args.mjs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { readFrontmatter } from '../lib/frontmatter.mjs';
+import { CASE_ID, CASE_TYPES, VERDICT_CASE_TYPES, PATTERN, SESSION_ID, casesDir, goriRoot, loadCases as loadCasesOf, loadRetractions as loadRetractionsOf, retractionsDir } from '../lib/learning.mjs';
+import { secretKinds } from '../lib/secrets.mjs';
+import { humanMessages, projectsDir, readLines, sessionFiles, squash } from '../lib/transcripts.mjs';
+
+const USAGE = `使い方:
+  case add --id <YYYY-MM-DD-slug> --type ${CASE_TYPES.join('|')} --pattern <slug>
+           (--session <ID> --message <uuid> | --verdict <gori/repos/<名前>/verdicts/<sha>/<file>.json のパス>)
+           --quote <短い引用> --body <何が起き、何が正しかったか> [--root <gori>] [--projects <dir>]
+  case retract --id <事例の id> --reason <何が誤りで、なぜ事例でないか> [--root <gori>]
+  case list [--pattern <slug>] [--root <gori>]      取り消した事例を除く
+  case count --pattern <slug> [--min <n>] [--root <gori>]   取り消した事例を除く。--min に満たなければ終了コード 1
+  case retracted [--root <gori>]                    取り消した事例と理由
+--root は gori のチェックアウト（worktree でもよい）。省くと現在のディレクトリの git の最上位を使う。どの worktree からでも同じ学び（git の共通ディレクトリの下の gori/learning/）を読み書きする`;
+
+const [sub, ...rest] = process.argv.slice(2);
+const { flags, positional: extra } = parseArgs(rest, { value: ['id', 'type', 'pattern', 'session', 'message', 'verdict', 'quote', 'body', 'reason', 'min', 'root', 'projects'] }, USAGE);
+if (extra.length) die(`引数 ${extra[0]} を読めない\n${USAGE}`, 2);
+
+function die(msg, code = 1) {
+  console.error(msg);
+  process.exit(code);
+}
+
+// 学びは gori の git の共通ディレクトリの下にあり、どの worktree から呼んでも同じ場所に解決する（tools/lib/learning.mjs の learningDir）。
+let root;
+let dir;
+let rdir;
+try {
+  root = goriRoot(flags.root);
+  dir = casesDir(root);
+  rdir = retractionsDir(root);
+} catch (e) {
+  die(e.message, 2);
+}
+const QUOTE_MAX = 200;
+
+// 取り消しの読み方と事例の一覧は tools/lib/learning.mjs に置き、metrics と同じ規則で数える。
+const loadRetractions = (opts) => loadRetractionsOf(root, opts);
+const loadCases = () => loadCasesOf(root);
+
+// 引用符の中にエスケープを書けない（tools/lib/frontmatter.mjs の部分集合）ので、使われていない側の引用符で囲む。
+function yamlQuote(s) {
+  if (!s.includes('"')) return `"${s}"`;
+  if (!s.includes("'")) return `'${s}'`;
+  return null;
+}
+
+function checkQuoteInTranscript(session, message, quote) {
+  const file = sessionFiles(projectsDir(flags.projects)).get(session);
+  if (!file) {
+    console.error(`注意: セッション ${session} の会話の記録が無いので、引用の照合を飛ばした`);
+    return;
+  }
+  const msg = humanMessages(readLines(file)).find((m) => m.message === message);
+  if (!msg) die(`quote-unverified: セッション ${session} の会話の記録に、uuid ${message} の人間の発言が無い`);
+  if (!squash(msg.text).includes(squash(quote))) die(`quote-unverified: uuid ${message} の発言に、引用「${quote}」が含まれていない。発言の文字列をそのまま短く切り出す`);
+}
+
+function checkQuoteInVerdict(path, quote, type) {
+  const file = resolve(path);
+  // レビュー結果は記録の場所（gori のチェックアウトの .git/gori/repos/<名前>/verdicts/）にある（tools/lib/audit.mjs の goriDir）。
+  const m = /\/gori\/repos\/[^/]+\/verdicts\/([^/]+\/[^/]+\.json)$/.exec(file);
+  if (!m) die(`--verdict には gori/repos/<名前>/verdicts/<sha>/<file>.json のパスを渡す（${path}）`, 2);
+  if (!existsSync(file)) die(`quote-unverified: レビュー結果 ${file} が無い。レビュー結果は消えない記録なので、無ければ事例にしない`);
+  let v;
+  try {
+    v = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    die(`quote-unverified: レビュー結果 ${file} を読めない`);
+  }
+  if (VERDICT_CASE_TYPES[v.result] !== type) die(`quote-unverified: レビュー結果 ${file} は ${v.result} で、--type ${type} の事例にできない（${Object.entries(VERDICT_CASE_TYPES).map(([r, t]) => `${r} は ${t}`).join('、')}）`);
+  if (!(v.findings ?? []).some((f) => squash(f).includes(squash(quote)))) die(`quote-unverified: レビュー結果 ${file} の findings に、引用「${quote}」が含まれていない`);
+  return m[1];
+}
+
+function add() {
+  const need = ['id', 'type', 'pattern', 'quote', 'body'];
+  const missing = need.filter((k) => !flags[k]?.trim());
+  if (missing.length) die(`${missing.map((k) => `--${k}`).join('、')} が無い\n${USAGE}`, 2);
+  const fromVerdict = flags.verdict !== undefined;
+  if (fromVerdict && (flags.session || flags.message)) die('--verdict と --session/--message は同時に渡さない', 2);
+  if (!fromVerdict && !(flags.session && flags.message)) die(`--session と --message、または --verdict を渡す\n${USAGE}`, 2);
+
+  const { id, type, pattern, body } = flags;
+  const quote = squash(flags.quote);
+  if (!CASE_ID.test(id)) die(`--id「${id}」は <YYYY-MM-DD>-<slug>（slug は小文字英数字とハイフン）でない`, 2);
+  if (!CASE_TYPES.includes(type)) die(`--type は ${CASE_TYPES.join(' | ')} のいずれか`, 2);
+  if (!PATTERN.test(pattern)) die(`--pattern「${pattern}」は小文字英数字とハイフンの slug でない`, 2);
+  if (fromVerdict && !Object.values(VERDICT_CASE_TYPES).includes(type)) die(`--verdict から書く事例の --type は ${Object.values(VERDICT_CASE_TYPES).join(' か ')} に限る`, 2);
+  if (!fromVerdict && !SESSION_ID.test(flags.session)) die(`--session「${flags.session}」はセッション ID の形でない`, 2);
+  if (!fromVerdict && !SESSION_ID.test(flags.message)) die(`--message「${flags.message}」は uuid の形でない`, 2);
+  if ([...quote].length > QUOTE_MAX) die(`--quote は ${QUOTE_MAX} 文字までにする（${[...quote].length} 文字）。発言の要所だけを切り出す`, 2);
+  if (quote.includes('\\')) die('--quote にバックスラッシュを含められない。含まない部分を切り出す', 2);
+  const yq = yamlQuote(quote);
+  if (yq === null) die('--quote に " と \' の両方を含められない。片方だけを含む部分を切り出す', 2);
+
+  const secrets = [...new Set([...secretKinds(quote), ...secretKinds(body)])];
+  if (secrets.length) die(`secret-like: --quote か --body に秘密情報らしい文字列（${secrets.join('、')}）がある。事例は長く残るので、伏せるか言い換える`);
+
+  const file = join(dir, `${id}.md`);
+  if (existsSync(file)) die(`case-exists: ${file} は既にある。事例は書き換えない。別の id を使う`);
+
+  let source;
+  if (fromVerdict) {
+    const ref = checkQuoteInVerdict(flags.verdict, quote, type);
+    source = `verdict: ${ref}`;
+    const dup = loadCases().find((c) => c.verdict === ref && c.pattern === pattern);
+    if (dup) die(`case-duplicate: レビュー結果 ${ref} の pattern ${pattern} の事例は ${dup.id} として既にある${dup.retracted ? '（取り消し済み）' : ''}`);
+  } else {
+    checkQuoteInTranscript(flags.session, flags.message, quote);
+    source = `session: ${flags.session}\nmessage: ${flags.message}`;
+    const dup = loadCases().find((c) => c.session === flags.session && c.message === flags.message && c.pattern === pattern);
+    if (dup) die(`case-duplicate: セッション ${flags.session} の発言 ${flags.message} の pattern ${pattern} の事例は ${dup.id} として既にある${dup.retracted ? '（取り消し済み）' : ''}`);
+  }
+
+  const text = `---\nid: ${id}\ntype: ${type}\npattern: ${pattern}\n${source}\nquote: ${yq}\n---\n\n${body.trim()}\n`;
+  const back = readFrontmatter(text);
+  if (back.error || back.fields.quote?.value !== quote) die(`frontmatter として読み戻せない: ${back.error?.message ?? 'quote が一致しない'}`);
+  mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(file, text, { flag: 'wx' });
+  } catch (e) {
+    if (e.code === 'EEXIST') die(`case-exists: ${file} は既にある。事例は書き換えない。別の id を使う`);
+    throw e;
+  }
+  console.log(file);
+}
+
+// 取り消しの日付は、事例の id の日付と同じく手元の暦で書く。toISOString は UTC なので、日本の朝に前日になる。
+function localDate(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function retract() {
+  const missing = ['id', 'reason'].filter((k) => !flags[k]?.trim());
+  if (missing.length) die(`${missing.map((k) => `--${k}`).join('、')} が無い\n${USAGE}`, 2);
+  const { id } = flags;
+  const reason = flags.reason.trim();
+  if (!CASE_ID.test(id)) die(`--id「${id}」は <YYYY-MM-DD>-<slug>（slug は小文字英数字とハイフン）でない`, 2);
+  if (!existsSync(join(dir, `${id}.md`))) die(`case-missing: 事例 ${id} が ${dir} に無い`);
+  const secrets = secretKinds(reason);
+  if (secrets.length) die(`secret-like: --reason に秘密情報らしい文字列（${secrets.join('、')}）がある。伏せるか言い換える`);
+  const file = join(rdir, `${id}.md`);
+  const text = `---\nid: ${id}\nretracted: ${localDate()}\n---\n\n${reason}\n`;
+  mkdirSync(rdir, { recursive: true });
+  try {
+    writeFileSync(file, text, { flag: 'wx' });
+  } catch (e) {
+    if (e.code === 'EEXIST') die(`retraction-exists: ${file} は既にある。取り消しも書き換えない`);
+    throw e;
+  }
+  console.log(file);
+}
+
+function retractedList() {
+  for (const [id, r] of loadRetractions()) console.log([id, r.error ? 'unreadable' : r.date, r.error ?? r.reason].join('\t'));
+}
+
+// 取り消した事例は list と count に出さない。重複の検査（add）は取り消した事例も見るので、同じ発言を同じ pattern で書き直せない。
+function list() {
+  if (flags.pattern !== undefined && !PATTERN.test(flags.pattern)) die('--pattern は小文字英数字とハイフンの slug', 2);
+  const rows = loadCases().filter((c) => !c.retracted && (flags.pattern === undefined || c.pattern === flags.pattern));
+  for (const c of rows) {
+    if (c.error) console.log([c.id, 'unreadable', c.error].join('\t'));
+    else console.log([c.id, c.type, c.pattern, c.verdict ? `verdict:${c.verdict}` : `${c.session}/${c.message}`].join('\t'));
+  }
+}
+
+// --min を渡すと、件数が満たないときに終了コード 1 で終わる。抽出の起票の判定（skills/extract 手順 5）を道具で決めるためである。
+// 件数は事例のファイルの数で、一件の事例の本文に書かれた出来事の数は数えない。
+function count() {
+  if (!flags.pattern || !PATTERN.test(flags.pattern)) die('count には --pattern <slug> を渡す', 2);
+  if ('min' in flags && !/^[1-9]\d*$/.test(flags.min ?? '')) die('--min は 1 以上の整数', 2);
+  const n = loadCases().filter((c) => !c.retracted && c.pattern === flags.pattern).length;
+  console.log(n);
+  if ('min' in flags && n < Number(flags.min)) process.exit(1);
+}
+
+if (sub === 'add') add();
+else if (sub === 'list') list();
+else if (sub === 'count') count();
+else if (sub === 'retract') retract();
+else if (sub === 'retracted') retractedList();
+else die(USAGE, 2);

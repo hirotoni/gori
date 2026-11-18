@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+// 指摘の下書き（drafts.json）を、PR の差分と既存のレビューに照らして検査する。
+// 使い方: check <PR の番号か URL> <drafts.json>
+// 終了コード: 0 合格、1 違反あり（一件一行で理由を出す）、2 使い方の誤りか gh の失敗
+import { checkDrafts, fetchReviewState, prTarget, readDrafts, runMain } from '../lib/pr.mjs';
+
+runMain(() => {
+  const [pr, draftsPath] = process.argv.slice(2);
+  const target = prTarget(pr);
+  const drafts = readDrafts(draftsPath);
+  const problems = checkDrafts(drafts, fetchReviewState(target));
+  if (problems.length > 0) {
+    for (const p of problems) console.log(`NG ${p}`);
+    return 1;
+  }
+  console.log(`OK 指摘 ${drafts.comments.length} 件`);
+  return 0;
+});

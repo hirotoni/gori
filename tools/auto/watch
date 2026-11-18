@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// 無人の作業の見回り（docs/design.md の「自律起動」の「窓口」）。窓口のセッションがバックグラウンドで走らせる。
+// 決めた間隔ごとに tools/auto/run を呼び、人間に知らせることができたときだけ終わる。claude は自分では起動しない。
+import { spawnSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from '../lib/args.mjs';
+import { autoLimits } from '../lib/auto.mjs';
+import { autoStatus, loadRuns, statusLines } from '../lib/auto-status.mjs';
+import { goriCheckout } from '../lib/pool.mjs';
+
+const USAGE = `使い方: watch
+起動してすぐ tools/auto/run を一回呼び、その後は knowledge/config/auto.md の watch-minutes の間隔で呼ぶ。
+run の結果が none（進める一件が無い）か locked（別の run が動いている）なら、待って続ける。
+merged（学びを無人で取り込んだ）なら、知らせずに、待たずに次の一回を呼ぶ。取り込んだ後の記録に残ったことがあれば、続けずに終わる。
+pass、stopped、failed、daily-limit のどれかか、残ったことのある merged か、run が結果を出さずに落ちたら、tools/auto/status の内容を出して終わる。
+最後の行に RESULT=<pass|merged-left|stopped|failed|daily-limit> を出す。merged-left は、残ったことのある取り込みである。
+終了コード: 0 合格、残ったことのある取り込み、停止、一日の上限で終わった、1 失敗で終わった、2 設定を読めない（何も起動しない）
+環境変数: GORI_ROOT、GORI_CLAUDE_BIN（テスト用。run にそのまま渡る）`;
+const { flags, positional } = parseArgs(process.argv.slice(2), { bool: ['help'] }, USAGE);
+if (flags.help) {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (positional.length) {
+  console.error(`引数 ${positional.join(' ')} を読めない\n${USAGE}`);
+  process.exit(2);
+}
+
+const toolRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const pad = (n) => String(n).padStart(2, '0');
+const clock = () => {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+for (;;) {
+  // 間隔は見回りのたびに読む。読めなければ、run を呼ばずに終わる。
+  let gori;
+  let minutes;
+  try {
+    gori = goriCheckout(toolRoot);
+    minutes = autoLimits(gori)['watch-minutes'];
+  } catch (e) {
+    console.error(`watch: 設定を読めないので何も起動しない: ${e.message}`);
+    process.exit(2);
+  }
+  const r = spawnSync(process.execPath, [join(toolRoot, 'tools', 'auto', 'run')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 16 * 1024 * 1024 });
+  const out = r.stdout ?? '';
+  const result = /^RESULT=(\S+)$/m.exec(out)?.[1] ?? null;
+  // 学びの無人の取り込みは知らせない（docs/design.md の「知らせ」）。待たずに次の一件を見る。
+  // 取り込んだ後の記録に残ったことがあれば、人間が直すことがあるので、続けずに終わる。
+  if (r.status === 0 && result === 'merged' && !(loadRuns(gori).at(-1)?.left?.length)) {
+    console.log(`${clock()} 見回り: 学びを無人で取り込んだ。続けて次の一件を見る`);
+    continue;
+  }
+  if (r.status === 0 && (result === 'none' || result === 'locked')) {
+    console.log(`${clock()} 見回り: ${result === 'none' ? '進める一件が無い' : '別の run が動いている'}。${minutes} 分後にまた見る`);
+    await new Promise((done) => setTimeout(done, minutes * 60_000));
+    continue;
+  }
+  // 知らせることができた。run の出力と、今の状態を出して終わる。
+  const failed = r.status !== 0 || result === null || result === 'failed';
+  const body = out.split('\n').filter((l) => l && !/^RESULT=/.test(l)).join('\n');
+  if (body) console.log(body);
+  if (result === null) console.log(`${clock()} 見回り: run が結果を出さずに終わった（終了コード ${r.status ?? '無し'}${r.signal ? `、シグナル ${r.signal}` : ''}）。失敗として扱う`);
+  try {
+    console.log(statusLines(autoStatus(gori, toolRoot)).join('\n'));
+  } catch (e) {
+    console.error(`watch: 状態を読めない: ${e.message}`);
+  }
+  console.log(`RESULT=${failed ? 'failed' : result === 'merged' ? 'merged-left' : result}`);
+  process.exit(failed ? 1 : 0);
+}

@@ -1,0 +1,216 @@
+#!/usr/bin/env node
+// 改善の効果を週ごとに数える（H-I12）。何も書き換えない。
+// 判断の記録とレビュー結果は tools/records/trace の出力だけから数え、記録を直接読む集計を別に持たない。
+// 事例は tools/learning/case の list、count と同じ規則（tools/lib/learning.mjs）で、取り消した事例を除いて数える。
+// 会話の記録は読まない。訂正の回数は事例から数えるので、会話の記録が消えた期間も数えられる。
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { availableParallelism, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { TASK_ID, goriDir, resolveRepoDir, validTime } from '../lib/audit.mjs';
+import { learningDir, loadCases } from '../lib/learning.mjs';
+import { loadItems } from '../lib/pool.mjs';
+
+const USAGE = `使い方: metrics [--root <チェックアウト>] [--learnings] [--text]
+  週（ISO 週、月曜始まり、ローカル時刻）ごとに、次を数える。数が 0 の組は出さない。
+  cases         pattern ごとの事例の件数（事例 id の日付の週、取り消した事例を除く）
+  step-skip     判断の記録の step-skip 行の数（行の time の週）。key は <手順書>#<番号>:<手順の文の先頭 20 字>。
+                手順の番号は作業を始めたときの手順書のもので、文の先頭で版の違う手順を分ける。その場で書いた手順書の作業は key を - にまとめる
+  verdict-fail  レビュー結果の不合格の数（レビュー結果の time の週）
+  verdict-unverified  レビュー結果の確認できずの数（レビュー結果の time の週）。確かめる手段の不足を、成果の不備（verdict-fail）と分けて数える
+  review-light  軽い重さ（文書だけの変更）で受けたレビュー結果の数（レビュー結果の time の週）
+  既定の出力は TSV（week metric key count）。--text は人間向けの表にする。
+  --learnings を付けると、週ごとの数の代わりに、--root のリポジトリのプールで done の学び（kind が learning）ごとに一行を出す。
+    applied     適用日。プールの一件を done にした日付（updated のローカル時刻の日付）
+    before、same、after  同じ pattern の事例（取り消した事例を除く）を、事例 id の日付で適用日の前、同じ日、後に分けた件数
+    last-after  後の事例のうち最も新しい日付（無ければ -）
+    days        取り消していない全事例の最も新しい日付から適用日を引いた日数（事例が無ければ -）。抽出の済んでいない期間は after に入らないので、after が 0 でも days が小さければ効いた証拠にならない。負なら、適用より後の事例をまだ一件も抽出していない
+    updated を読めない一件と pattern の無い一件は出さず、注意を標準エラーに出す。`;
+
+const args = process.argv.slice(2);
+const flags = {};
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--text') flags.text = true;
+  else if (args[i] === '--learnings') flags.learnings = true;
+  else if (args[i] === '--help' || args[i] === '-h') {
+    console.log(USAGE);
+    process.exit(0);
+  } else if (args[i] === '--root' && i + 1 < args.length) flags.root = args[++i];
+  else die(`引数 ${args[i]} を読めない\n${USAGE}`, 2);
+}
+
+function die(msg, code = 1) {
+  console.error(msg);
+  process.exit(code);
+}
+
+// 判断の記録は、--root のリポジトリの記録の場所（gori のチェックアウトの .git/gori/repos/<名前>/audit）から読む。
+// 学びは --root のチェックアウトの git の共通ディレクトリの下の gori/learning/ から読む。どちらも worktree から呼んでも、本体と同じ場所に解決する。
+const root = resolveRepoDir(flags.root);
+try {
+  goriDir(root);
+  learningDir(root);
+} catch (e) {
+  die(e.message, 2);
+}
+const TRACE = join(dirname(fileURLToPath(import.meta.url)), '..', 'records', 'trace');
+
+const pad = (n) => String(n).padStart(2, '0');
+// 暦の日付（年、月、日）の ISO 週。その週の木曜日が属する年を週の年とする。
+function isoWeek(y, m, d) {
+  const day = Date.UTC(y, m - 1, d);
+  const dow = (new Date(day).getUTCDay() + 6) % 7;
+  const thu = new Date(day + (3 - dow) * 86400000);
+  const year = thu.getUTCFullYear();
+  const week = 1 + Math.floor((thu.getTime() - Date.UTC(year, 0, 1)) / 86400000 / 7);
+  return `${year}-W${pad(week)}`;
+}
+// 時刻の週は、ローカル時刻の日付で決める。
+const weekOfTime = (t) => {
+  const d = new Date(t);
+  return isoWeek(d.getFullYear(), d.getMonth() + 1, d.getDate());
+};
+
+// 索引の手順書（procedures/<id>）から始めた作業だけ、step-skip を手順ごとに分ける。その場で書いた手順書（- や stdin）は手順の番号が作業ごとに別のものを指す。
+const SHARED_PROCEDURE = /^procedures\/[a-z0-9-]+$/;
+const METRICS = ['cases', 'step-skip', 'verdict-fail', 'verdict-unverified', 'review-light'];
+const counts = new Map();
+const bump = (week, metric, key = '-') => {
+  const k = JSON.stringify([week, metric, key]);
+  counts.set(k, (counts.get(k) ?? 0) + 1);
+};
+
+// 事例
+for (const c of loadCases(root)) {
+  if (c.retracted) continue;
+  const m = /^(\d{4})-(\d{2})-(\d{2})-/.exec(c.id);
+  if (c.error || !c.pattern || !m) {
+    console.error(`注意: 事例 ${c.id} を読めない（${c.error ?? (m ? 'pattern が無い' : 'id が日付で始まらない')}）。数えない`);
+    continue;
+  }
+  bump(isoWeek(Number(m[1]), Number(m[2]), Number(m[3])), 'cases', c.pattern);
+}
+
+// 作業。作業 ID の一覧だけを判断の記録のファイル名から取り、中身は trace の出力から数える。
+const auditDir = join(goriDir(root), 'audit');
+const tasks = existsSync(auditDir) ? readdirSync(auditDir).filter((n) => n.endsWith('.tsv')).map((n) => n.slice(0, -4)).filter((t) => TASK_ID.test(t)).sort() : [];
+// 呼び出し元（pre-commit など）の GIT_* を trace の git に漏らさない。
+const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+
+// 人間向けの表。全角文字は幅 2 に数え、right に挙げた列は右に寄せる。
+function printTable(head, body, right, empty = '（数えるものが無い）') {
+  const width = (s) => [...s].reduce((n, ch) => n + (ch.charCodeAt(0) > 0xff ? 2 : 1), 0);
+  const w = head.map((h, i) => Math.max(width(h), ...body.map((r) => width(r[i]))));
+  const line = (cells) => cells.map((c, i) => (right.includes(i) ? ' '.repeat(w[i] - width(c)) + c : c + ' '.repeat(w[i] - width(c)))).join('  ').trimEnd();
+  console.log(line(head));
+  for (const r of body) console.log(line(r));
+  if (body.length === 0) console.log(empty);
+}
+const printTsv = (head, body) => {
+  console.log(head.join('\t'));
+  for (const r of body) console.log(r.join('\t'));
+};
+
+// 学びごとの効果（--learnings）。事例の日付と適用日を日付の文字列（YYYY-MM-DD）で比べる。判断の記録は読まない。
+if (flags.learnings) {
+  const caseDates = [];
+  for (const c of loadCases(root)) {
+    const m = /^(\d{4}-\d{2}-\d{2})-/.exec(c.id);
+    if (!c.retracted && !c.error && c.pattern && m) caseDates.push({ pattern: c.pattern, date: m[1] });
+  }
+  const latest = caseDates.reduce((a, c) => (c.date > a ? c.date : a), '');
+  const localDate = (t) => {
+    const d = new Date(t);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+  const dayNum = (d) => Date.UTC(Number(d.slice(0, 4)), Number(d.slice(5, 7)) - 1, Number(d.slice(8, 10))) / 86400000;
+  let items;
+  try {
+    items = loadItems(join(goriDir(root), 'pool'));
+  } catch (e) {
+    die(e.message, 2);
+  }
+  const rows = [];
+  for (const it of items) {
+    const f = it.fields;
+    if (f.kind !== 'learning' || f.status !== 'done') continue;
+    if (!f.pattern) {
+      console.error(`注意: 学び ${it.id} に pattern が無い。出さない`);
+      continue;
+    }
+    if (!validTime(f.updated)) {
+      console.error(`注意: 学び ${it.id} の updated「${f.updated ?? ''}」を読めない。出さない`);
+      continue;
+    }
+    const applied = localDate(f.updated);
+    const same = caseDates.filter((c) => c.pattern === f.pattern);
+    const after = same.filter((c) => c.date > applied).map((c) => c.date).sort();
+    rows.push([it.id, f.pattern, applied, String(same.filter((c) => c.date < applied).length), String(same.filter((c) => c.date === applied).length), String(after.length), after.at(-1) ?? '-', latest ? String(dayNum(latest) - dayNum(applied)) : '-']);
+  }
+  if (flags.text) printTable(['学び', 'pattern', '適用日', '前', '当日', '後', '後の最後', '見た日数'], rows, [3, 4, 5, 7], '（適用した学びが無い）');
+  else printTsv(['id', 'pattern', 'applied', 'before', 'same', 'after', 'last-after', 'days'], rows);
+  process.exit(0);
+}
+
+// 会話の記録を読ませないため、trace の --projects には空のディレクトリを渡す。
+const noProjects = mkdtempSync(join(tmpdir(), 'gori-metrics-noprojects-'));
+// trace は作業ごとに git を何度も呼ぶので、作業ごとの trace は並べて走らせる。数え方は作業の順に依らない。
+const traceOf = (task) =>
+  new Promise((done) => {
+    const child = spawn(process.execPath, [TRACE, task, '--repo', root, '--projects', noProjects], { env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (d) => (stdout += d));
+    child.stderr.setEncoding('utf8').on('data', (d) => (stderr += d));
+    child.on('error', (e) => done({ status: null, stdout, stderr: `${stderr}${e.message}` }));
+    child.on('close', (status) => done({ status, stdout, stderr }));
+  });
+const results = new Map();
+let failure = null;
+try {
+  const queue = [...tasks];
+  const worker = async () => {
+    while (queue.length) {
+      const task = queue.shift();
+      results.set(task, await traceOf(task));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(8, availableParallelism())) }, worker));
+} finally {
+  rmSync(noProjects, { recursive: true, force: true });
+}
+for (const task of tasks) {
+  const r = results.get(task);
+  if (r.status !== 0) {
+    failure ??= `trace ${task} が失敗した（終了コード ${r.status}）: ${r.stderr.trim()}`;
+    continue;
+  }
+  const rows = r.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const timed = (row, what) => {
+    if (validTime(row.time)) return true;
+    console.error(`注意: 作業 ${task} の ${what} の time「${row.time}」を読めない。数えない`);
+    return false;
+  };
+  const procedure = rows.find((row) => row.source === 'audit' && row.kind === 'start')?.procedure;
+  const stepText = new Map(rows.filter((row) => row.source === 'audit' && row.kind === 'step').map((row) => [row.step, row.text]));
+  const skipKey = (row) => (SHARED_PROCEDURE.test(procedure ?? '') ? `${procedure}#${row.step}:${[...(stepText.get(row.step) ?? '')].slice(0, 20).join('')}` : '-');
+  for (const row of rows) {
+    if (row.source === 'audit' && row.kind === 'step-skip' && timed(row, 'step-skip 行')) bump(weekOfTime(row.time), 'step-skip', skipKey(row));
+    if (row.source === 'verdict' && row.kind === 'fail' && timed(row, '不合格のレビュー結果')) bump(weekOfTime(row.time), 'verdict-fail');
+    if (row.source === 'verdict' && row.kind === 'unverified' && timed(row, '確認できずのレビュー結果')) bump(weekOfTime(row.time), 'verdict-unverified');
+    if (row.source === 'verdict' && row.weight === 'light' && timed(row, '軽いレビューのレビュー結果')) bump(weekOfTime(row.time), 'review-light');
+  }
+}
+// 一つの作業でも trace が失敗すれば、少なく数えた数を出さずに止まる。
+if (failure) die(failure);
+
+const out = [...counts]
+  .map(([k, count]) => {
+    const [week, metric, key] = JSON.parse(k);
+    return { week, metric, key, count };
+  })
+  .sort((a, b) => a.week.localeCompare(b.week) || METRICS.indexOf(a.metric) - METRICS.indexOf(b.metric) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+if (flags.text) printTable(['週', '指標', 'key', '数'], out.map((r) => [r.week, r.metric, r.key, String(r.count)]), [3]);
+else printTsv(['week', 'metric', 'key', 'count'], out.map((r) => [r.week, r.metric, r.key, r.count]));

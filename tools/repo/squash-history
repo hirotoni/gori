@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# 手元の main（無ければ master）の履歴を、ツリーを変えずに、親の無い一つの commit に畳む。
+# 作業ツリーに未 commit の変更があるとき、main の他にローカルのブランチがあるとき、無人の作業（tools/auto/run）が動いているときは、何も変えずに止まる。
+# 作業の途中の記録（レビュー結果、レビューの起点）は commit の SHA を指すので、作業のブランチが残っているうちは畳まない。
+# 控えは作らず、push もしない。畳む前の commit は、reflog が切れるまでしか戻せない。
+# 使い方: squash-history（gori の本体のチェックアウトで、main を checkout して実行する）
+# 出力: 畳んだら SQUASHED=<旧い SHA>..<新しい SHA>、既に一つの commit なら ALREADY_SQUASHED=<SHA>
+# 終了コード: 0 畳んだか既に一つ、2 使い方の誤りか畳めない状態
+set -u
+err() { echo "squash-history: $*" >&2; }
+[ $# -eq 0 ] || { err "使い方: squash-history"; exit 2; }
+if ! common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  err "git リポジトリの中で実行する"
+  exit 2
+fi
+main=""
+for b in main master; do
+  if git show-ref --verify -q "refs/heads/$b"; then main="$b" && break; fi
+done
+if [ -z "$main" ]; then
+  err "ローカルの main も master も無い"
+  exit 2
+fi
+if [ "$(git branch --show-current)" != "$main" ]; then
+  err "$main を checkout した本体のチェックアウトで実行する"
+  exit 2
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  err "未 commit の変更か、追跡していないファイルがある。片付けてから実行する"
+  exit 2
+fi
+others="$(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx "$main")"
+if [ -n "$others" ]; then
+  err "$main の他にローカルのブランチがある。作業を終えて消してから実行する: $(printf '%s' "$others" | tr '\n' ' ')"
+  exit 2
+fi
+lock="$common/gori/auto/run.lock"
+if [ -f "$lock" ] && pid="$(tr -d '[:space:]' <"$lock")" && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+  err "無人の作業が動いている（pid ${pid}）。終わってから実行する"
+  exit 2
+fi
+old="$(git rev-parse "refs/heads/$main")"
+if [ -z "$(git rev-list --parents -n 1 "$old" | cut -s -d' ' -f2-)" ]; then
+  echo "ALREADY_SQUASHED=$old"
+  exit 0
+fi
+new="$(git commit-tree "$old^{tree}" -m "initial commit")" || { err "commit を作れない"; exit 2; }
+git update-ref -m "squash-history: 履歴を一つの commit に畳む" "refs/heads/$main" "$new" "$old" || { err "$main を移せない"; exit 2; }
+echo "SQUASHED=$old..$new"

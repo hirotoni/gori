@@ -1,0 +1,3 @@
+#!/bin/sh
+# commit のたびの全体は重いので、変えたファイルに関わるテストだけを走らせる。全体はレビュアーが走らせる。
+exec "$(git rev-parse --show-toplevel)/tests/run.sh" --changed

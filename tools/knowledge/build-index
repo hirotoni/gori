@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { discoverUnits, loadUnit, parseRootArg } from '../lib/units.mjs';
+
+const check = process.argv.includes('--check');
+const rootArg = process.argv.includes('--root') ? parseRootArg(process.argv) : null;
+if (process.argv.includes('--root') && !rootArg) {
+  console.error('--root にはディレクトリを渡す');
+  process.exit(2);
+}
+const root = resolve(rootArg ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+
+const rows = [];
+let failed = false;
+for (const unit of discoverUnits(root)) {
+  if (unit.kind !== 'procedure' && unit.kind !== 'criterion') continue;
+  const u = loadUnit(root, unit);
+  const when = u.fields?.when;
+  if (u.error || when?.type !== 'scalar' || when.value.trim() === '') {
+    console.error(`${u.path}: 索引を作れない（frontmatter か when が不正。tools/knowledge/lint で確認する）`);
+    failed = true;
+    continue;
+  }
+  const oneLine = (v) => v.replace(/\s+/g, ' ').trim();
+  const row = [u.key, oneLine(when.value)];
+  // 判断基準の行は規則も持つ。本体を読まなくても、規則が毎回文脈に入るようにするためである。
+  if (unit.kind === 'criterion') {
+    const rule = u.fields?.rule;
+    if (rule?.type !== 'scalar' || rule.value.trim() === '') {
+      console.error(`${u.path}: 索引を作れない（rule が不正。tools/knowledge/lint で確認する）`);
+      failed = true;
+      continue;
+    }
+    row.push(oneLine(rule.value));
+  }
+  rows.push([...row, `\${CLAUDE_PLUGIN_ROOT}/${u.path}`]);
+}
+if (failed) process.exit(1);
+
+rows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+const out = ['# 索引', '', ...rows.map((r) => r.join('\t'))].join('\n') + '\n';
+const target = join(root, 'knowledge', 'index.md');
+
+if (check) {
+  if (!existsSync(target) || readFileSync(target, 'utf8') !== out) {
+    console.error('knowledge/index.md が知識ファイルの frontmatter から生成した内容と違う。tools/knowledge/build-index で再生成する');
+    process.exit(1);
+  }
+  console.log('build-index: knowledge/index.md は最新');
+} else {
+  if (!existsSync(target) || readFileSync(target, 'utf8') !== out) writeFileSync(target, out);
+}

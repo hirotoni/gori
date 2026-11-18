@@ -1,0 +1,6 @@
+# 利用者の Claude Code のフックは、編集した .md を作業ツリーのルートで prettier --write する。
+# knowledge/ の知識ファイルは frontmatter を YAML の部分集合（一行の [a, b]）で書き、index.md はタブ区切りで生成する。
+# prettier はどちらも崩し、lint と build-index --check を落とすので、整形の対象から外す。
+# prettier はこのファイルを走らせたディレクトリからしか読まないので、ルート以外で走らせるフックには効かない。
+# learning/cases/ の事例も同じ部分集合で書くが、tools/learning/case だけが書き、手で編集しないので外していない。
+knowledge/

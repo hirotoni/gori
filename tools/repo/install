@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# gori のチェックアウトからの導入。何度実行しても同じ状態になる。
+set -eu
+
+usage() {
+  cat <<'EOF'
+使い方: tools/repo/install [-h | --help]
+
+このスクリプトを置いた gori のチェックアウトを、このマシンに導入する。引数は取らない。
+  - マーケットプレイス gori の参照先をこのチェックアウトにし、プラグイン gori@gori を入れる
+  - core.hooksPath を tools/repo/githooks にする
+git worktree の中では実行できない。本体のチェックアウトの tools/repo/install を実行する。
+EOF
+}
+
+# 引数は使い方の表示だけを受け付ける。どの場合も、claude を呼ぶ前に判定を終える。
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -h | --help)
+      if [ "$#" -eq 1 ]; then
+        usage
+        exit 0
+      fi
+      ;;
+  esac
+  echo "install: 引数を受け付けない: $*" >&2
+  usage >&2
+  exit 2
+fi
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+
+missing=""
+for cmd in git node claude; do
+  command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+done
+if [ -n "$missing" ]; then
+  echo "install: 次のコマンドが無い:$missing" >&2
+  exit 1
+fi
+
+# マーケットプレイスの参照先は root になる。worktree を参照させると、片付けたときに gori が読み込めなくなる。
+if ! git_dir="$(git -C "$root" rev-parse --path-format=absolute --git-dir 2>/dev/null)" ||
+  ! common_dir="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  echo "install: $root は git のチェックアウトでない。gori を clone したチェックアウトで実行する" >&2
+  exit 1
+fi
+if [ "$git_dir" != "$common_dir" ]; then
+  echo "install: $root は git worktree であり、本体のチェックアウトでない。導入しない" >&2
+  # 本体の場所は worktree list の先頭に出る。common dir の親とすると、--separate-git-dir の clone で外れる。
+  main_dir="$(git -C "$root" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')"
+  echo "  本体のチェックアウト ${main_dir:-（不明）} の tools/repo/install を実行する" >&2
+  exit 1
+fi
+
+claude plugin marketplace add "$root"
+claude plugin install gori@gori
+git -C "$root" config core.hooksPath tools/repo/githooks
+
+echo "install: 完了。このチェックアウト $root を gori として読み込む"

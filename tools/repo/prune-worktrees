@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# 本体のチェックアウトの .worktree/<リポジトリ名>/ の下の worktree のうち、片付けてよいものを示し、--apply で片付ける。
+# 片付けてよい（REMOVABLE）のは、次をすべて満たすものに限る。
+# - マージ済み：ブランチの先端が既定ブランチ（ローカルか origin）に含まれる。含まれなければ、gh で merged の PR があり、その head の SHA がブランチの先端と一致する（squash merge）。
+# - git status が空で、git が無視するファイル（.gitignore に当たるもの）も、作り直せるものの一覧（REGENERABLE）に当たるものしか無い。
+#   無視されたファイルは commit されていないので、worktree ごと消すと取り戻せない。git status を実行できなければ消さない。
+# - ブランチに一つでも commit をしたことがある（作ったばかりで commit の無い worktree は、使われていても既定ブランチに含まれて見えるため）。
+# - この道具を実行したシェルが中にいない。
+# 判定できないもの（gh が使えない、PR が未マージで閉じられた）は KEEP として「要判断」と示し、消さない。
+# --apply は、REMOVABLE の worktree と、そのローカルのブランチを消す。リモートのブランチは消さない。
+# 使い方: prune-worktrees [--apply]
+# 出力: 1 件 1 行。REMOVABLE|KEEP <パス> <ブランチ> <理由>。--apply では REMOVED|FAILED の行が続く。
+# 終了コード: 0 成功、1 片付けに失敗したものがある、2 使い方の誤り
+set -u
+err() { echo "prune-worktrees: $*" >&2; }
+
+apply=0
+case "${1:-}" in
+  --apply) apply=1 ;;
+  "") ;;
+  *) err "使い方: prune-worktrees [--apply]"; exit 2 ;;
+esac
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  err "git リポジトリの中で実行する"
+  exit 2
+fi
+root="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+g() { git -C "$root" "$@"; }
+base_dir="$root/.worktree/$(basename "$root")"
+here="$(pwd -P)"
+
+# 含まれているかを比べる既定ブランチ。ローカルと origin の両方を見る。
+defaults=()
+remote_default="$(g symbolic-ref -q --short refs/remotes/origin/HEAD)"
+[ -n "$remote_default" ] && defaults+=("$remote_default")
+for b in main master; do
+  if g show-ref --verify -q "refs/heads/$b"; then defaults+=("$b") && break; fi
+done
+
+# 無視されたファイルのうち、消しても作り直せるもの。パスのどこかにこの名前の部分があるか、名前が *.pyc なら当たる。
+REGENERABLE=(__pycache__ node_modules .pytest_cache .mypy_cache .ruff_cache)
+regenerable() {
+  local p=${1%/} part
+  case "$p" in *.pyc) return 0 ;; esac
+  local IFS=/
+  for part in $p; do
+    local r
+    for r in "${REGENERABLE[@]}"; do [ "$part" = "$r" ] && return 0; done
+  done
+  return 1
+}
+
+# 判定の結果を、パス、ブランチ、消し方（d か D）、理由の順にタブ区切りで貯める。
+results=()
+judge() {
+  local path=$1 branch=$2 tip reflog prs status
+  if [ -z "$branch" ]; then echo "KEEP	-	要判断: ブランチが無い（detached HEAD）"; return; fi
+  if [ ! -d "$path" ]; then echo "KEEP	-	ディレクトリが無い（git worktree prune で登録を消せる）"; return; fi
+  case "$here/" in "$path"/*) echo "KEEP	-	このシェルが中にいる"; return ;; esac
+  if ! status="$(git -C "$path" status --porcelain --ignored=matching 2>/dev/null)"; then echo "KEEP	-	要判断: git status を実行できない"; return; fi
+  if printf '%s\n' "$status" | grep -qv -e '^!! ' -e '^$'; then echo "KEEP	-	未 commit の変更がある"; return; fi
+  local kept=() f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    regenerable "$f" || kept+=("$f")
+  done < <(printf '%s\n' "$status" | sed -n 's/^!! //p')
+  if [ "${#kept[@]}" -gt 0 ]; then
+    local shown="${kept[*]:0:5}"
+    [ "${#kept[@]}" -gt 5 ] && shown="$shown ほか $(( ${#kept[@]} - 5 )) 件"
+    echo "KEEP	-	要判断: 無視されたファイルが残る: $shown"; return
+  fi
+  reflog="$(g reflog show --format=%gs "refs/heads/$branch" 2>/dev/null)"
+  if [ "$(printf '%s\n' "$reflog" | grep -c .)" -eq 1 ] && printf '%s\n' "$reflog" | grep -q '^branch: Created from'; then
+    echo "KEEP	-	ブランチに commit が無い（作ったばかりの可能性がある）"; return
+  fi
+  tip="$(git -C "$path" rev-parse HEAD)"
+  local d
+  for d in ${defaults[@]+"${defaults[@]}"}; do
+    if g merge-base --is-ancestor "$tip" "$d"; then echo "REMOVABLE	d	$d に含まれる"; return; fi
+  done
+  if ! command -v gh >/dev/null 2>&1; then echo "KEEP	-	要判断: 既定ブランチに含まれず、gh が無いので PR を確かめられない"; return; fi
+  if ! prs="$(cd "$root" && gh pr list --head "$branch" --state all --json number,state,headRefOid --jq '.[] | "\(.number) \(.state) \(.headRefOid)"' 2>/dev/null)"; then
+    echo "KEEP	-	要判断: 既定ブランチに含まれず、gh で PR を確かめられない"; return
+  fi
+  local num state oid merged_other="" closed="" open=""
+  while read -r num state oid; do
+    [ -n "$num" ] || continue
+    case "$state" in
+      MERGED)
+        if [ "$oid" = "$tip" ]; then echo "REMOVABLE	D	PR #$num がマージ済み"; return; fi
+        merged_other="$num" ;;
+      CLOSED) closed="$num" ;;
+      OPEN) open="$num" ;;
+    esac
+  done <<<"$prs"
+  if [ -n "$open" ]; then echo "KEEP	-	PR #$open が開いている"
+  elif [ -n "$merged_other" ]; then echo "KEEP	-	要判断: PR #$merged_other のマージの後に commit がある"
+  elif [ -n "$closed" ]; then echo "KEEP	-	要判断: PR #$closed が未マージのまま閉じられた"
+  else echo "KEEP	-	未マージで PR が無い"
+  fi
+}
+
+path="" branch=""
+flush() {
+  if [ -n "$path" ]; then
+    case "$path" in
+      "$base_dir"/*)
+        local verdict kind mode reason
+        verdict="$(judge "$path" "$branch")"
+        IFS=$'\t' read -r kind mode reason <<<"$verdict"
+        echo "$kind $path ${branch:--} $reason"
+        [ "$kind" = REMOVABLE ] && results+=("$path	$branch	$mode")
+        ;;
+    esac
+  fi
+  path="" branch=""
+}
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*) flush; path="${line#worktree }" ;;
+    "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+  esac
+done < <(g worktree list --porcelain)
+flush
+
+[ "$apply" -eq 1 ] || exit 0
+failed=0
+for r in ${results[@]+"${results[@]}"}; do
+  IFS=$'\t' read -r p b mode <<<"$r"
+  if ! out="$(g worktree remove "$p" 2>&1)"; then
+    echo "FAILED $p $b worktree remove: $out"; failed=1; continue
+  fi
+  if ! out="$(g branch "-$mode" "$b" 2>&1)"; then
+    echo "FAILED $p $b branch -$mode: $out"; failed=1; continue
+  fi
+  echo "REMOVED $p $b"
+done
+exit "$failed"

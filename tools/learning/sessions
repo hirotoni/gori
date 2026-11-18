@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+// 抽出の材料になるセッションを、gori の SessionEnd フックが積んだ抽出待ち（tools/lib/learning.mjs の pendingDir）から選び、処理したセッションを抽出待ちから消す。
+// 抽出待ちにあるのは、gori が読み込まれ、終わった会話だけである。
+// 会話の記録は読むだけで、写しも退避もしない。
+import { parseArgs } from '../lib/args.mjs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { TASK_ID, envSessionId, git, goriDir, humanWindow, parseAudit, resolveRepoDir, validTime } from '../lib/audit.mjs';
+import { SESSION_ID, dequeue, goriRoot, learningDir, readPending } from '../lib/learning.mjs';
+import { humanMessages, isExtractionSession, isHeadlessSession, projectsDir, readLines, sessionFiles } from '../lib/transcripts.mjs';
+
+const USAGE = `使い方:
+  sessions --unprocessed [--projects <dir>] [--root <gori>]
+  sessions mark <セッションID>... [--root <gori>]
+  sessions human <セッションID> [--projects <dir>] [--outside-tasks --repo <dir>]`;
+
+const { flags, positional } = parseArgs(process.argv.slice(2), { value: ['projects', 'repo', 'root'], bool: ['unprocessed', 'outside-tasks'] }, USAGE);
+const die = (msg, code = 2) => {
+  console.error(msg);
+  process.exit(code);
+};
+const root = () => {
+  try {
+    const r = goriRoot(flags.root);
+    learningDir(r);
+    return r;
+  } catch (e) {
+    return die(e.message);
+  }
+};
+
+// 作業 ID は、そのセッションが判断の記録に書いた行から機械的に求める。会話の文面から推測しない。
+// 記録の場所（gori のチェックアウトの .git/gori/repos/<名前>/audit）を決められなければ（git のリポジトリでない、gori が見つからない、repo.yml が食い違う）、作業は無いとする。
+function tasksOf(repo, session) {
+  let audit;
+  try {
+    audit = join(goriDir(repo), 'audit');
+  } catch {
+    return [];
+  }
+  if (!existsSync(audit)) return [];
+  const out = [];
+  for (const f of readdirSync(audit).filter((n) => n.endsWith('.tsv')).sort()) {
+    const rows = parseAudit(readFileSync(join(audit, f), 'utf8')).slice(1);
+    if (rows.some((r) => r.row.session === session)) out.push(f.slice(0, -'.tsv'.length));
+  }
+  return out;
+}
+
+// 会話の cwd が片付けた課題の worktree なら、cwd は無いが記録は gori のチェックアウトの下の、そのリポジトリの本体の名前の場所に残っている。
+// cwd の最も近い既存の祖先が git の作業ツリーなら、そのリポジトリの記録を引く。作業 ID はセッション ID で照合するので、別のリポジトリに当たっても誤って拾わない。
+// dispatch のように worktree を本体の .worktree/ の下に置く前提である。本体の外に置いた worktree の記録は、祖先からは引けない。
+// 最も近い既存の祖先が git の作業ツリーでなければ、それより上の祖先は探さない。
+function recordsBase(cwd) {
+  if (!cwd) return null;
+  for (let d = dirname(cwd); d !== dirname(d); d = dirname(d)) {
+    if (existsSync(d)) return git(d, ['rev-parse', '--show-toplevel']);
+  }
+  return null;
+}
+
+// 抽出待ちの会話を出す。GORI_EXTRACT_SESSIONS で名指しされたら、その会話だけを、抽出待ちに無くても会話の記録から探して出す。
+// 会話の記録が消えていれば human 0 で出し、抽出は読まずに mark する。
+function unprocessed() {
+  const r = root();
+  const self = envSessionId();
+  const projects = projectsDir(flags.projects);
+  const pending = readPending(r);
+  const only = process.env.GORI_EXTRACT_SESSIONS ? [...new Set(process.env.GORI_EXTRACT_SESSIONS.split(',').map((s) => s.trim()).filter(Boolean))].sort() : null;
+  let targets = [...pending];
+  if (only) {
+    const files = only.some((id) => !pending.has(id)) ? sessionFiles(projects) : new Map();
+    targets = only.map((id) => [id, pending.get(id) ?? files.get(id)]);
+  }
+  for (const [session, file] of targets) {
+    if (session === self) continue;
+    if (!file) {
+      console.error(`${session}: 会話の記録が見つからないので出さない`);
+      continue;
+    }
+    const rows = existsSync(file) ? readLines(file) : [];
+    if (isHeadlessSession(rows)) continue;
+    if (isExtractionSession(rows)) {
+      if (only) console.error(`${session}: 抽出だけの会話なので出さない（抽出を呼んだ発言のほかに人間の発言が無い）`);
+      continue;
+    }
+    const cwd = rows.find((o) => typeof o.cwd === 'string')?.cwd ?? null;
+    let repo = cwd && existsSync(cwd) ? (git(cwd, ['rev-parse', '--show-toplevel']) ?? cwd) : null;
+    let tasks = repo ? tasksOf(repo, session) : [];
+    // cwd が無くても、祖先の作業ツリーにこのセッションの記録があれば、その作業ツリーを repo として出す（trace --repo にそのまま渡せる）。
+    if (!repo) {
+      const base = recordsBase(cwd);
+      tasks = base ? tasksOf(base, session) : [];
+      if (tasks.length) repo = base;
+    }
+    const human = humanMessages(rows).length;
+    console.log(JSON.stringify({ session, file, projects, cwd, repo, tasks, human }));
+  }
+}
+
+// 処理を終えた会話を抽出待ちから消す。再開した会話がもう一度終われば、フックがまた積む。
+function mark() {
+  const ids = [...new Set(positional.slice(1))];
+  if (ids.length === 0) die(USAGE);
+  const bad = ids.filter((id) => !SESSION_ID.test(id));
+  if (bad.length) die(`セッション ID の形でない: ${bad.join(' ')}`);
+  const r = root();
+  for (const id of ids) console.log(`${id}\t${dequeue(r, id) ? 'marked' : 'already'}`);
+}
+
+function human() {
+  const session = positional[1];
+  if (!session || !SESSION_ID.test(session)) die(USAGE);
+  const file = sessionFiles(projectsDir(flags.projects)).get(session);
+  if (!file) die(`セッション ${session} の会話の記録が無い`, 1);
+  // --outside-tasks は、このセッションの作業の trace がどれも読まない発言だけを出す。
+  // 最初の作業の start より前の発言などである。期間は trace と同じ humanWindow で決めるので、作業の期間の中の発言は出さない。
+  // 時刻を読めない発言は trace が読まないので、ここで出す。
+  let windows = [];
+  if (flags['outside-tasks']) {
+    if (!flags.repo) die(USAGE);
+    const repo = resolveRepoDir(flags.repo);
+    // trace は作業 ID の形でない名前を拒むので、その記録の期間は除かない。
+    windows = tasksOf(repo, session).filter((t) => TASK_ID.test(t)).map((t) => humanWindow(repo, t, session)).filter(Boolean);
+  }
+  const inside = (m) => validTime(m.time) && windows.some((w) => Date.parse(m.time) >= w.from && Date.parse(m.time) <= w.to);
+  for (const m of humanMessages(readLines(file))) if (!inside(m)) console.log(JSON.stringify({ session, ...m }));
+}
+
+if (flags.unprocessed) unprocessed();
+else if (positional[0] === 'mark') mark();
+else if (positional[0] === 'human') human();
+else die(USAGE);

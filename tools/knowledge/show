@@ -1,0 +1,124 @@
+#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readFrontmatter } from '../lib/frontmatter.mjs';
+import { mentions, parseRootArg, unitPath } from '../lib/units.mjs';
+
+const argv = process.argv.slice(2);
+const rootArg = argv.includes('--root') ? parseRootArg(process.argv) : null;
+if (argv.includes('--root') && !rootArg) fail('--root にはディレクトリを渡す', 2);
+const root = resolve(rootArg ?? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+const rootAt = argv.indexOf('--root');
+const key = argv.find((a, i) => !a.startsWith('--') && (rootAt < 0 || i !== rootAt + 1));
+if (!key) fail('使い方: show <参照キー> [--root <dir>]', 2);
+
+function fail(msg, code = 1) {
+  console.error(msg);
+  process.exit(code);
+}
+
+function load(k, from) {
+  const rel = unitPath(root, k);
+  if (!rel) fail(`${from ? `${from} の参照 ` : ''}${k} が実在する知識ファイルを指していない`);
+  const u = readFrontmatter(readFileSync(resolve(root, rel), 'utf8'));
+  if (u.error) fail(`${rel}:${u.error.line}: frontmatter を読めない: ${u.error.message}`);
+  const refs = u.fields.refs?.type === 'list' ? u.fields.refs.value : [];
+  const scalar = (n) => (u.fields[n]?.type === 'scalar' ? u.fields[n].value.replace(/\s+/g, ' ').trim() : '');
+  return { key: k, kind: scalar('kind'), path: rel, refs, lead: scalar('when') || scalar('description'), rule: scalar('rule'), body: trimBlank(u.bodyLines) };
+}
+
+function trimBlank(lines) {
+  let a = 0;
+  let b = lines.length;
+  while (a < b && lines[a].trim() === '') a++;
+  while (b > a && lines[b - 1].trim() === '') b--;
+  return lines.slice(a, b);
+}
+
+// 段落、箇条書きや番号付きリストの項目、見出しを一つの塊にする。コードブロックは割らない。
+function blocks(lines) {
+  const out = [];
+  let cur = null;
+  let fence = null;
+  const close = () => {
+    cur = null;
+  };
+  const open = (l) => {
+    cur = [l];
+    out.push(cur);
+  };
+  for (const l of lines) {
+    const mark = /^\s*(```|~~~)/.exec(l);
+    if (fence !== null) {
+      cur.push(l);
+      if (mark && mark[1] === fence) fence = null;
+      continue;
+    }
+    if (mark) {
+      if (!cur) open(l);
+      else cur.push(l);
+      fence = mark[1];
+      continue;
+    }
+    if (l.trim() === '') {
+      close();
+      out.push(null);
+    } else if (/^#{1,6}\s/.test(l)) {
+      open(l);
+      close();
+    } else if (/^ {0,3}([-*]|\d+\.)\s/.test(l)) {
+      open(l);
+    } else if (cur) cur.push(l);
+    else open(l);
+  }
+  return out;
+}
+
+// 能力と役割は実行時に呼ぶものなので、手順の流れを読む妨げにならないよう一行の要約だけを折り込む。
+const SUMMARIZED = new Set(['capability', 'role']);
+
+function quote(ref) {
+  const lines = SUMMARIZED.has(ref.kind)
+    ? [`**${ref.key}**：${ref.lead}（本文は ${ref.path}）`]
+    : [`**${ref.key}**`, '', ...(ref.rule ? [ref.rule, ''] : []), ...ref.body];
+  if (!SUMMARIZED.has(ref.kind) && ref.refs.length) lines.push('', `参照: ${ref.refs.join(', ')}`);
+  return lines.map((l) => (l === '' ? '>' : `> ${l}`));
+}
+
+const unit = load(key);
+const refs = unit.refs.map((r) => load(r, key));
+const placed = new Set();
+const out = [`# ${unit.key}`];
+if (unit.lead) out.push(unit.lead);
+if (unit.rule) out.push(unit.rule);
+out.push('');
+const isListItem = (b) => /^ {0,3}([-*]|\d+\.)\s/.test(b[0]);
+// リストの項目で名指しされた知識ファイルは、リストが途切れないよう、リスト全体の後に折り込む。
+let pending = [];
+const flush = () => {
+  for (const r of pending) {
+    if (out.at(-1) !== '') out.push('');
+    out.push(...quote(r), '');
+  }
+  pending = [];
+};
+for (const b of blocks(unit.body)) {
+  if (b === null) {
+    flush();
+    if (out.at(-1) !== '') out.push('');
+    continue;
+  }
+  if (!isListItem(b)) flush();
+  out.push(...b);
+  const text = b.join('\n');
+  const here = refs
+    .filter((r) => !placed.has(r.key) && mentions(text, r.key))
+    .sort((x, y) => text.indexOf(x.key) - text.indexOf(y.key));
+  for (const r of here) placed.add(r.key);
+  pending.push(...here);
+  if (!isListItem(b)) flush();
+}
+flush();
+for (const r of refs) if (!placed.has(r.key)) console.error(`警告: ${r.key} は本文に現れないので折り込まなかった`);
+console.log(out.join('\n'));

@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+// 振り分けの指示は不明なら実行する側に倒す（要件 5 章）。どんな失敗でも終了コード 0 で、読めたものは出す。
+// 末尾に GORI_SYSTEM_REPORT の値を足す。0 なら 0、それ以外の値と未設定は既定の 1 である（報告の規則は config/routing）。
+// その後に、人間の対応が要ることを当てはまるときだけ一行ずつ足す。承認待ちの候補の件数と、直近の抽出の失敗（H-I4、H-I10）、無人の作業の取り込み待ち、停止、失敗である（H-E11）。
+import { spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// この gori のチェックアウトの下の全リポジトリのプールで、proposed の件数を数える。git のチェックアウトでなければ何も足さない。
+async function pendingNotice(root) {
+  try {
+    const r = spawnSync('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' });
+    if (r.status !== 0) return null;
+    const { loadItems } = await import('../lib/pool.mjs');
+    const repos = join(r.stdout.trim(), 'gori', 'repos');
+    let names;
+    try {
+      names = readdirSync(repos, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return null;
+    }
+    let n = 0;
+    for (const name of names) {
+      try {
+        n += loadItems(join(repos, name, 'pool')).filter((it) => it.fields.status === 'proposed').length;
+      } catch (e) {
+        console.error(`session-start: ${name} のプールを読めない: ${e.message}`);
+      }
+    }
+    if (n === 0) return null;
+    return `承認待ち: 改善候補のプールに proposed の候補が ${n} 件ある（\`${join(root, 'tools', 'records', 'pool')} list --all --status proposed\` で一覧できる）。人間の対応が要ることなので、GORI_SYSTEM_REPORT が 0 でも、最初の返答の終わりに件数を一行で人間に伝える。`;
+  } catch (e) {
+    console.error(`session-start: 承認待ちの件数を数えられない: ${e.message}`);
+    return null;
+  }
+}
+
+// 実際に走った最新の抽出（exit= の行を持つログ）が失敗していれば知らせる。起動を見送った記録（skipped=）は読み飛ばす。
+async function extractNotice() {
+  try {
+    const { goriHome } = await import('../lib/learning.mjs');
+    const dir = join(goriHome(), 'logs');
+    let files;
+    try {
+      files = readdirSync(dir).filter((f) => /^extract-.+\.log$/.test(f)).sort().reverse();
+    } catch {
+      return null;
+    }
+    for (const f of files) {
+      let text;
+      try {
+        text = readFileSync(join(dir, f), 'utf8');
+      } catch {
+        continue;
+      }
+      const field = (k) => new RegExp(`^${k}=(.*)$`, 'm').exec(text)?.[1].trim();
+      const exit = field('exit');
+      if (exit === undefined) continue;
+      const scout = field('procedure-scout-exit');
+      const bad = [exit !== '0' && `exit=${exit}`, scout !== undefined && scout !== '0' && scout !== '-' && `procedure-scout-exit=${scout}`].filter(Boolean);
+      if (!bad.length) return null;
+      const m = /^extract-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z\.log$/.exec(f);
+      const at = m ? new Date(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`) : null;
+      const p = (x) => String(x).padStart(2, '0');
+      const when = at && !Number.isNaN(at.getTime()) ? `${at.getFullYear()}-${p(at.getMonth() + 1)}-${p(at.getDate())} ${p(at.getHours())}:${p(at.getMinutes())}` : f;
+      return `抽出の失敗: 直近の抽出（${when}）が ${bad.join('、')} で終わった。ログ: ${join(dir, f)}。人間の対応が要ることなので、GORI_SYSTEM_REPORT が 0 でも、最初の返答の終わりに一行で人間に伝える。`;
+    }
+    return null;
+  } catch (e) {
+    console.error(`session-start: 抽出のログを読めない: ${e.message}`);
+    return null;
+  }
+}
+
+// 無人の作業（tools/auto/run）のうち、人間の対応が要るもの。窓口を閉じていた間の控えである。
+async function autoNotices(root) {
+  try {
+    const r = spawnSync('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' });
+    if (r.status !== 0) return [];
+    const { autoStatus } = await import('../lib/auto-status.mjs');
+    // レビュー結果を確かめる道具は、このフックと同じチェックアウトのものを使う。
+    const { merge, stopped, failure } = autoStatus(root, resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+    const tail = `（\`${join(root, 'tools', 'auto', 'status')}\` で一覧できる）。人間の対応が要ることなので、GORI_SYSTEM_REPORT が 0 でも、最初の返答の終わりに一行で人間に伝える。`;
+    return [
+      merge.length && `取り込み待ち: 無人の作業でレビューに合格し、人間の取り込みを待つ作業が ${merge.length} 件ある${tail}`,
+      stopped.length && `止まった作業: 無人の作業で、人間を待って止まった作業が ${stopped.length} 件ある${tail}`,
+      failure && `無人の作業の失敗: 直近の実行（${failure.when}、${failure.pool}）が失敗で終わった: ${failure.reason}${tail}`,
+    ].filter(Boolean);
+  } catch (e) {
+    console.error(`session-start: 無人の作業の状態を読めない: ${e.message}`);
+    return [];
+  }
+}
+
+const FALLBACK = '依頼を受けたら、gori の knowledge/index.md を読み、当てはまる手順書に従う。当てはまる手順書が無ければ、その場で手順書を設計する。';
+
+try {
+  const root = process.env.CLAUDE_PLUGIN_ROOT || resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const read = (rel) => {
+    try {
+      return readFileSync(join(root, rel), 'utf8').replace(/\r\n/g, '\n');
+    } catch (e) {
+      console.error(`session-start: ${rel} を読めない: ${e.message}`);
+      return null;
+    }
+  };
+  // 閉じの --- が無いなど壊れた frontmatter は剥がせないので、全体を本文として出す。
+  const stripFrontmatter = (text) => {
+    const lines = text.split('\n');
+    if (lines[0].trimEnd() !== '---') return text;
+    const end = lines.findIndex((l, i) => i > 0 && l.trimEnd() === '---');
+    return end < 0 ? text : lines.slice(end + 1).join('\n');
+  };
+  const parts = [];
+  const routing = read('knowledge/config/routing.md');
+  parts.push(routing === null ? FALLBACK : stripFrontmatter(routing));
+  for (const [rel, strip] of [['knowledge/config/triggers.md', true], ['knowledge/index.md', false]]) {
+    const text = read(rel);
+    if (text !== null) parts.push(strip ? stripFrontmatter(text) : text);
+  }
+  const systemReport = (process.env.GORI_SYSTEM_REPORT ?? '').trim() === '0' ? '0' : '1';
+  parts.push(`GORI_SYSTEM_REPORT=${systemReport}`);
+  // 抽出、レビュー、無人の作業のセッションは人間と話さないので、足さない。
+  if (!process.env.GORI_EXTRACTING && !process.env.GORI_REVIEWING && !Object.hasOwn(process.env, 'GORI_AUTO')) {
+    const notices = [await pendingNotice(root), await extractNotice(), ...(await autoNotices(root))].filter(Boolean);
+    if (notices.length) parts.push(notices.join('\n'));
+  }
+  const out = parts.map((p) => p.trim()).filter(Boolean).join('\n\n');
+  process.stdout.write(`${out.split('${CLAUDE_PLUGIN_ROOT}').join(root)}\n`);
+} catch (e) {
+  console.error(`session-start: ${e.message}`);
+  try {
+    process.stdout.write(`${FALLBACK}\n`);
+  } catch {}
+}
+process.exit(0);

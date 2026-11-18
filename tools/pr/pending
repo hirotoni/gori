@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+// 指摘の下書き（drafts.json）を検査し、通れば pending review を一つ作り、作ったレビューを取り直して照合する。
+// event は送らない。submit、削除の口は無い。submit は人間が GitHub で行う。
+// 使い方: pending <PR の番号か URL> <drafts.json>
+// 終了コード: 0 作成と照合に成功、1 検査の違反か照合の食い違い、2 使い方の誤りか gh の失敗
+import { checkDrafts, compareComments, fetchReviewState, ghApi, pendingPayload, prTarget, readDrafts, runMain } from '../lib/pr.mjs';
+
+runMain(() => {
+  const [pr, draftsPath] = process.argv.slice(2);
+  const target = prTarget(pr);
+  const drafts = readDrafts(draftsPath);
+  const state = fetchReviewState(target);
+  const problems = checkDrafts(drafts, state);
+  if (problems.length > 0) {
+    for (const p of problems) console.log(`NG ${p}`);
+    console.log('検査に落ちたので、レビューを作らない');
+    return 1;
+  }
+  const payload = pendingPayload(drafts, state.pr.head.sha);
+  const created = ghApi(`${target.base}/reviews`, { method: 'POST', body: payload });
+  if (created.state !== 'PENDING') {
+    console.log(`NG 作られたレビュー（id ${created.id}）の状態が PENDING でない: ${created.state}。GitHub で確かめる`);
+    return 1;
+  }
+  const got = ghApi(`${target.base}/reviews/${created.id}/comments?per_page=100`, { paginate: true }).flat();
+  const diffs = compareComments(payload.comments, got);
+  if (diffs.length > 0) {
+    for (const d of diffs) console.log(`NG ${d}`);
+    console.log(`レビュー（id ${created.id}、${created.html_url}）は PENDING で作られたが、中身が下書きと一致しない。GitHub で確かめる`);
+    return 1;
+  }
+  console.log(JSON.stringify({ result: 'PENDING', reviewId: created.id, url: created.html_url, comments: got.length }));
+  return 0;
+});

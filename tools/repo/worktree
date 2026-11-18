@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# 作業 ID ごとの git worktree を、本体のチェックアウトの .worktree/<リポジトリ名>/<作業ID> に作り、ブランチ <作業ID> を割り当てる。
+# 本体の下に置くのは、worktree を片付けた後も、会話の cwd の祖先からリポジトリを引き、その記録（本体のチェックアウトの名前で引く gori のチェックアウトの .git/gori/repos/<名前>/）を引けるようにするためである。
+# 起点: origin があれば fetch して origin/<既定ブランチ>。ただし同名のローカルのブランチがそれを含めば（先行・同一）ローカルのブランチにする。
+# 分岐していれば、ローカルのブランチを起点にし、UPSTREAM_DIVERGED=<ローカルの SHA>...<origin の SHA> の一行で知らせる（docs/design.md の「公開と上流」）。
+# 環境変数 GORI_IGNORE_UPSTREAM=1 なら、origin を fetch せず、ローカルの main（無ければ master）を起点にする（0 か未設定なら上のとおり）。origin が無いか既定ブランチが分からなければ、ローカルの main（無ければ master）。
+# 同じ作業 ID で再実行すると、既にある worktree をそのまま返す。ブランチだけあれば、そのブランチで worktree を作る。
+# 使い方: worktree <作業ID>
+# 出力: BASE=<起点>（新しくブランチを作ったときだけ）、分岐していれば UPSTREAM_DIVERGED=<ローカル>...<origin>、BRANCH=<ブランチ>、最終行に WORKTREE_DIR=<絶対パス>
+# 終了コード: 0 成功、1 git の失敗、2 使い方の誤り（GORI_IGNORE_UPSTREAM の値の誤りを含む）
+set -u
+err() { echo "worktree: $*" >&2; }
+
+id="${1:-}"
+# 作業 ID の形は tools/lib/audit.mjs の TASK_ID だけで決める（新しい形 <YYYYMMDD>-<hhmmss>-<slug> と古い形 <YYYY-MM-DD>-<slug>）。
+audit="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/audit.mjs"
+if ! node --input-type=module -e 'const { TASK_ID } = await import(process.argv[1]); process.exit(TASK_ID.test(process.argv[2]) ? 0 : 1);' "$audit" "$id"; then
+  err "使い方: worktree <作業ID>（<YYYYMMDD>-<hhmmss>-<slug>。古い形 <YYYY-MM-DD>-<slug> も受け付ける。slug は小文字英数字とハイフン。作業 ID は log start --slug が発行する）"
+  exit 2
+fi
+
+if ! common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  err "git リポジトリの中で実行する"
+  exit 2
+fi
+# 本体のチェックアウトは git worktree list の最初の作業ツリーである。どの worktree の中で実行しても同じ場所に作る。
+root="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+if [ -z "$root" ] || [ ! -d "$root" ]; then
+  err "本体のチェックアウトが見つからない"
+  exit 1
+fi
+g() { git -C "$root" "$@"; }
+
+dir="$root/.worktree/$(basename "$root")/$id"
+if g worktree list --porcelain | grep -qxF "worktree $dir"; then
+  echo "BRANCH=$(git -C "$dir" branch --show-current)"
+  echo "WORKTREE_DIR=$dir"
+  exit 0
+fi
+if [ -e "$dir" ]; then
+  err "$dir があるが git の worktree ではない。中を確かめて片付けてから実行し直す"
+  exit 1
+fi
+
+# .worktree を git に拾わせない。共有の .gitignore は変えず、このチェックアウトだけの exclude に足す。
+exclude="$common/info/exclude"
+mkdir -p "$common/info"
+if ! grep -qxE '/?\.worktree/?' "$exclude" 2>/dev/null; then
+  echo ".worktree" >>"$exclude"
+fi
+mkdir -p "$(dirname "$dir")"
+
+if g show-ref --verify -q "refs/heads/$id"; then
+  g worktree add -q "$dir" "$id" || exit 1
+else
+  base=""
+  case "${GORI_IGNORE_UPSTREAM:-0}" in
+    0) upstream=1 ;;
+    1) upstream=0 ;;
+    *) err "GORI_IGNORE_UPSTREAM は 0 か 1 にする（${GORI_IGNORE_UPSTREAM}）"; exit 2 ;;
+  esac
+  if [ "$upstream" = 1 ] && g remote get-url origin >/dev/null 2>&1; then
+    g fetch -q origin || err "origin の fetch に失敗した。最後に取得した状態を起点にする"
+    base="$(g symbolic-ref -q --short refs/remotes/origin/HEAD)"
+    if [ -z "$base" ]; then
+      for b in main master; do
+        if g show-ref --verify -q "refs/remotes/origin/$b"; then base="origin/$b" && break; fi
+      done
+    fi
+    [ -n "$base" ] || err "origin の既定ブランチが分からない。ローカルの既定ブランチを起点にする"
+    # review はローカルの既定ブランチの先端を含まない commit のレビューを断る（criteria/done）。
+    # ローカルが origin を含む（先行・同一）ならローカルから分岐し、レビューの前の載せ直しを要らなくする。
+    local_b="${base#origin/}"
+    if [ -n "$base" ] && g show-ref --verify -q "refs/heads/$local_b"; then
+      if g merge-base --is-ancestor "$base" "$local_b"; then
+        base="$local_b"
+      elif ! g merge-base --is-ancestor "$local_b" "$base"; then
+        echo "UPSTREAM_DIVERGED=$(g rev-parse "$local_b")...$(g rev-parse "$base")"
+        err "ローカルの $local_b と $base が分かれている。ローカルの $local_b を起点にする。origin を扱わせないなら GORI_IGNORE_UPSTREAM=1 を設定する"
+        base="$local_b"
+      fi
+    fi
+  fi
+  if [ -z "$base" ]; then
+    for b in main master; do
+      if g show-ref --verify -q "refs/heads/$b"; then base="$b" && break; fi
+    done
+  fi
+  if [ -z "$base" ]; then
+    err "起点にする既定ブランチ（origin/HEAD、main、master）が見つからない"
+    exit 1
+  fi
+  # 起点の追跡を付けない。付けると、作業ブランチでの pull が既定ブランチを取り込む。
+  g worktree add -q --no-track -b "$id" "$dir" "$base" || exit 1
+  echo "BASE=$base"
+fi
+echo "BRANCH=$id"
+echo "WORKTREE_DIR=$dir"

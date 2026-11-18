@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// PR のレビューの材料（PR 本体、変更ファイルと patch、レビュー、レビューコメント、PR へのコメント、check run）を一つの JSON にまとめる。
+// 使い方: collect <PR の番号か URL> [--out <ファイル>]
+import { writeFileSync } from 'node:fs';
+import { PrError, collect, prTarget, runMain } from '../lib/pr.mjs';
+
+runMain(() => {
+  const args = process.argv.slice(2);
+  const i = args.indexOf('--out');
+  const out = i >= 0 ? args[i + 1] : null;
+  if (i >= 0 && !out) throw new PrError('--out にはファイルのパスを渡す');
+  const rest = i >= 0 ? args.filter((_, j) => j !== i && j !== i + 1) : args;
+  const json = `${JSON.stringify(collect(prTarget(rest[0])), null, 2)}\n`;
+  if (out) {
+    writeFileSync(out, json);
+    console.log(out);
+  } else process.stdout.write(json);
+  return 0;
+});

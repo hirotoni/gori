@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+// 作業 ID のブランチから、GitHub の draft PR を一つ作る。作る PR は常に draft で、draft でない PR を作る指定は無い。
+// 作るのは、作業のブランチの HEAD が独立レビューに合格しているとき（verdict check が 0 に当たる状態）だけである。
+// push はしない。作業のブランチが origin に無いか、origin の先頭が HEAD と違えば、PR を作らずに push するよう伝えて止まる。
+// 同じブランチの open の PR が既にあれば、新しく作らず、本文だけを今の内容に更新する。何度実行しても同じ状態になる。
+// 本文は、判断の記録の目的（start 行）、今も有効な受け入れ条件、レビュー結果の一行から作る。判断の行（decision など）は入れない。
+// GitHub への呼び出しは gh api に任せ、トークンには触らない（tools/lib/pr.mjs）。マージ、レビュアーの指名、ラベルの口は無い。
+// 使い方: draft-pr --task <作業ID> [--title <題>] [--base <ブランチ>] [--footer <本文の末尾に足す文>] [--repo <dir>]
+// 出力: 最終行に PR_URL=<URL>
+// 終了コード: 0 作ったか更新した、1 作らなかった（合格していない、origin のブランチが HEAD と違う、作られた PR が draft でない）、2 使い方の誤りか gh や git の失敗
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from '../lib/args.mjs';
+import { RecordsError, TASK_ID, TASK_ID_FORM, acceptState, auditPath, git, parseAudit, resolveRepoDir, verdictState, workBase } from '../lib/audit.mjs';
+import { PoolError, acceptanceItems, goriCheckout, mainBranch, readItem, resolvePool } from '../lib/pool.mjs';
+import { PrError, ghApi, runMain } from '../lib/pr.mjs';
+
+const goriRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const USAGE = '使い方: draft-pr --task <作業ID> [--title <題>] [--base <ブランチ>] [--footer <本文の末尾に足す文>] [--repo <dir>]';
+const { flags, positional } = parseArgs(process.argv.slice(2), { value: ['task', 'title', 'base', 'footer', 'repo'] }, USAGE);
+const stop = (msg, code = 2) => {
+  throw new PrError(msg, code);
+};
+
+runMain(() => {
+  if (positional.length) stop(`引数 ${positional.join(' ')} を読めない\n${USAGE}`);
+  const task = flags.task;
+  if (!task || !TASK_ID.test(task)) stop(`--task には ${TASK_ID_FORM} の作業 ID を渡す`);
+
+  const probe = spawnSync('gh', ['--version'], { encoding: 'utf8' });
+  if (probe.error) stop('gh が見つからない。GitHub CLI を入れて gh auth login する');
+
+  const repo = resolveRepoDir(flags.repo, task);
+  const branch = git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch !== task) stop(`${repo} のブランチは ${branch ?? '不明'} で、作業 ID のブランチ ${task} でない。作業の worktree で実行する`);
+  const sha = git(repo, ['rev-parse', 'HEAD']);
+  let audit;
+  try {
+    audit = auditPath(repo, task);
+  } catch (e) {
+    if (e instanceof RecordsError) stop(e.message);
+    throw e;
+  }
+  if (!existsSync(audit)) stop(`${audit} が無い。作業の記録が無い作業の PR は作らない`);
+
+  const verdict = verdictState(repo, task, sha, audit);
+  if (verdict.code !== 0) stop(`${verdict.state}: ${verdict.reason}\nレビューに合格していないので、PR を作らない`, 1);
+
+  if (git(repo, ['remote', 'get-url', 'origin']) === null) stop(`${repo} に origin が無い。PR を作れない`);
+  const remote = git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]);
+  if (remote === null) stop('origin を読めない（git ls-remote が失敗した）');
+  const remoteSha = remote.split(/\s+/)[0] || null;
+  if (remoteSha !== sha) {
+    stop(`origin の ${branch} は ${remoteSha ? remoteSha.slice(0, 12) : '無い'}。HEAD は ${sha.slice(0, 12)}。この道具は push しない。git push origin ${branch} を実行してから、やり直す`, 1);
+  }
+
+  const numbered = parseAudit(readFileSync(audit, 'utf8')).slice(1);
+  const start = numbered.find((r) => r.row.type === 'start')?.row;
+  if (!start) stop(`${audit}: start 行が無い`);
+  const { corrections, active } = acceptState(numbered);
+  // 訂正された条件は、最後の訂正の文で載せる。pool:<ID> の行は、プールの一件のその時点の受け入れ条件に開く。
+  const criteria = active.flatMap((r) => {
+    const fixed = corrections.filter((c) => c.target === r.line).at(-1);
+    if (fixed) return [fixed.row.what.replace(/^.*?を訂正\s*[:：]?\s*/, '')];
+    const ref = /^pool:(\S+)$/.exec(r.row.what.trim());
+    if (!ref) return [r.row.what];
+    try {
+      const items = acceptanceItems(readItem(resolvePool(goriCheckout(goriRoot), repo).poolDir, ref[1]).body);
+      if (items.length === 0) stop(`pool:${ref[1]} に受け入れ条件が無い`);
+      return items;
+    } catch (e) {
+      if (e instanceof PoolError) stop(`accept 行 pool:${ref[1]} の受け入れ条件を読めない: ${e.message}`);
+      throw e;
+    }
+  });
+  if (criteria.length === 0) stop(`${audit}: 有効な受け入れ条件が無い`);
+
+  const body = [
+    '## 目的',
+    '',
+    start.what,
+    '',
+    '## 受け入れ条件',
+    '',
+    ...criteria.map((c) => `- ${c}`),
+    '',
+    '## レビュー結果',
+    '',
+    `${verdict.state}: ${verdict.reason}`,
+    ...(flags.footer ? ['', flags.footer] : []),
+    '',
+  ].join('\n');
+
+  const open = ghApi(`repos/{owner}/{repo}/pulls?state=open&head={owner}:${branch}`);
+  if (Array.isArray(open) && open.length > 0) {
+    const updated = ghApi(`repos/{owner}/{repo}/pulls/${open[0].number}`, { method: 'PATCH', body: { body } });
+    console.log(`同じブランチの PR が既にあるので、本文を更新した`);
+    console.log(`PR_URL=${updated.html_url ?? open[0].html_url}`);
+    return 0;
+  }
+
+  const base = flags.base ?? mainBranch(repo);
+  if (!base) stop(`${repo} に main も master も無い。--base でブランチを渡す`);
+  const title = flags.title ?? git(repo, ['log', '--reverse', '--format=%s', `${workBase(repo, start, sha).base}..${sha}`])?.split('\n')[0];
+  if (!title) stop('題を決められない（作業の commit が無い）。--title で渡す');
+  const created = ghApi('repos/{owner}/{repo}/pulls', { method: 'POST', body: { title, head: branch, base, body, draft: true } });
+  if (created.draft !== true) {
+    console.log(`NG 作られた PR（${created.html_url}）が draft でない。GitHub で確かめる`);
+    return 1;
+  }
+  console.log(`PR_URL=${created.html_url}`);
+  return 0;
+});

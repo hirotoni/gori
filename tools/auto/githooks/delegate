@@ -1,0 +1,16 @@
+#!/bin/sh
+# 柵のフックの置き場所が core.hooksPath を上書きするので、作業リポジトリが元から持つフックをここから呼ぶ。
+# 元の置き場所は、リポジトリの設定ファイルの core.hooksPath（相対なら作業ツリーの最上位から）、無ければ git の共通ディレクトリの hooks である。
+name="$1"
+shift
+own="$(git config --local --get core.hooksPath 2>/dev/null)"
+if [ -n "$own" ]; then
+  case "$own" in
+    /*) dir="$own" ;;
+    *) dir="$(git rev-parse --show-toplevel)/$own" ;;
+  esac
+else
+  dir="$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+fi
+[ -x "$dir/$name" ] || exit 0
+exec "$dir/$name" "$@"

@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+// 無人の作業のうち、人間の対応が要るものを出す（docs/design.md の「自律起動」の「知らせ」）。
+// 実行の記録と判断の記録を読むだけで、claude は起動しない。
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from '../lib/args.mjs';
+import { autoStatus, statusLines } from '../lib/auto-status.mjs';
+import { goriCheckout } from '../lib/pool.mjs';
+
+const USAGE = `使い方: status
+無人の作業（tools/auto/run）のうち、取り込み待ちの作業、人間を待って止まった作業、直近の失敗を出す。done になった作業は出さない。
+終了コード: 0 出した、2 記録を読めない
+環境変数: GORI_ROOT（テスト用。gori のチェックアウトの差し替え）`;
+const { flags, positional } = parseArgs(process.argv.slice(2), { bool: ['help'] }, USAGE);
+if (flags.help) {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (positional.length) {
+  console.error(`引数 ${positional.join(' ')} を読めない\n${USAGE}`);
+  process.exit(2);
+}
+const toolRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+try {
+  console.log(statusLines(autoStatus(goriCheckout(toolRoot), toolRoot)).join('\n'));
+} catch (e) {
+  console.error(`status: 記録を読めない: ${e.message}`);
+  process.exit(2);
+}
